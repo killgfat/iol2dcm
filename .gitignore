@@ -1,0 +1,85 @@
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 测试与静态检查
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# 运行产物
+out/
+*.log
+*.tmp
+*.bak
+
+# ---------------------------------------------------------------- 医疗数据
+# ★ 本项目处理患者生物测量数据。以下类型一律禁止入库：
+#   MDB 设备活库、.iol 检查文件、DICOM 实例、渲染出的报告单、
+#   状态文件（含 PatientID）、任何导出的中间数据。
+*.MDB
+*.mdb
+*.ldb
+*.laccdb
+*.iol
+*.dcm
+*.DCM
+*.xml
+out*.png
+report*.png
+*_report.png
+*.pdf
+
+# 状态文件（含 PatientID 与检查日期）
+state.json
+synced.json
+*synced.json
+lens_state.json
+patient_map.json
+
+# 常数表：**禁止入库**。
+# IOLCon 用户条款 8.1 只允许为自身计算目的使用数据并禁止再分发，
+# 因此本仓库不分发常数表。首次部署时自行生成：
+#     python3 pipeline.py constants
+# （需联网访问 iolcon.org；XML 解析器已内置，无需额外配置）
+iolcon_constants.json
+iolcon_lenses.xml
+
+# 现场配置：含院内路径、PACS 地址、机构名。仓库里只保留模板。
+config.local.yaml
+*.local.yaml
+
+# 环境与凭证
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

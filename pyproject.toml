@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iol2dcm"
+version = "1.3.1"
+description = "IOLMaster 500 MDB → 四公式晶体单 + OAM → DICOM → PACS（仅对 IOLMaster 500 测试）"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
+license = { file = "LICENSE" }
+keywords = ["dicom", "iol", "iolmaster", "biometry", "ophthalmology", "pacs"]
+authors = [{ name = "iol2dcm contributors" }]
+
+# ⚠️ 仅对 Carl Zeiss IOLMaster 500 测试。IOLMaster 700 及其他设备未经测试，
+#    不做任何可用性保证。详见 README「适用范围声明」与 DISCLAIMER.md。
+
+dependencies = [
+    # ★ 上限 <4：pydicom 4.0 移除了 Dataset.is_little_endian /
+    #   is_implicit_VR，而 dicomlib/ 的 build_sc / oam / keratometry 和
+    #   _to_native_le() 都依赖它们。4.0 一旦发布，不加上限就会被自动
+    #   升上去，然后在运行时报 AttributeError。适配后再放开。
+    "pydicom>=2.4,<4",
+    "pynetdicom>=2.0,<4",
+    "pillow>=9.0",
+    "numpy>=1.21",
+    # 0.0.6 是 2022 年的包，只有 sdist（纯 Python，装的时候不编译）。
+    # 0.1 若有 API 变更不保证兼容，先锁小版本。
+    "access_parser>=0.0.6,<0.1",
+]
+
+# ★ 必须在 [project] 的所有键之后：[project.urls] 一旦开始，
+#   后面出现的 dependencies 就会被当成 urls 表里的键。
+[project.urls]
+Homepage = "https://github.com/killgfat/iol2dcm"
+Repository = "https://github.com/killgfat/iol2dcm"
+Issues = "https://github.com/killgfat/iol2dcm/issues"
+
+[project.optional-dependencies]
+# PyYAML 可选：没有它时 core/config.py 用内置极简解析器
+yaml = ["pyyaml>=6.0"]
+
+# 不声明 console script：这是自动运行的管线，不是给人敲的命令。
+# 装包只为装依赖；入口是项目根的 pipeline.py，systemd 直接执行。
+
+[tool.setuptools]
+# pipeline.py 是入口脚本，不属于任何包
+py-modules = ["pipeline"]
+
+[tool.setuptools.packages.find]
+# 只认项目根下这 5 个包（按管线阶段划分，见 README）
+include = ["core*", "sources*", "formulas*", "render*", "dicomlib*"]

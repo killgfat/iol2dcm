@@ -1,0 +1,13 @@
+# 统一 LF。install.sh 一旦被 Windows 客户端转成 CRLF，
+# 到 Linux 上会以 "bad interpreter: /usr/bin/env bash^M" 直接失败。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+
+*.png  binary
+*.ttc  binary
+*.ttf  binary

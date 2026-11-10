@@ -1,0 +1,171 @@
+# iol2dcm 配置
+#
+# ⚠️ 适用范围：本项目仅对 Carl Zeiss IOLMaster 500（软件 V. 5.5）测试过。
+#    IOLMaster 700 及其他型号/厂商设备未经测试，不做任何可用性保证。
+#    详见 DISCLAIMER.md
+#
+# 换晶体型号只改本文件，不用动代码。
+# 常数表由 `pipeline.py constants` 从 IOLCon 生成
+# （optimized > ULIB > nominal 逐公式合并）。
+
+# ---------------------------------------------------------------- 晶体清单
+# 每款晶体生成一份独立的晶体单（一个 series）。
+#
+#   name      显示名，出现在 SeriesDescription（"IOL Repo <name>"）和报告单「晶状体」栏
+#   key       常数表里的型号全称，大小写敏感
+#             格式为 IOLCon 的「厂牌 型号」，如 "Johnson and Johnson Vision ZCB00"
+#             也可只写型号（如 "SZ-1"），唯一命中即可；多命中会报错要求写全称
+#
+# 查型号（本地查，毫秒级，不联网）：
+#     /opt/iol2dcm/venv/bin/python /opt/iol2dcm/pipeline.py \
+#         constants --show ZCB00 --local
+#
+# ⚠️ 同名不同款：IOLCon 有 7 组 key 相同但常数不同的条目
+#    （Ophtec AC 205 的 id 653 A=115.7 / id 654 A=116.9）。
+#    遇到这种必须写 "key@id" 指定，否则报错：
+#         key: Ophtec AC 205@654
+#    ⚠️ 分隔符是 @ 不是 # —— # 是 YAML 注释符，会被截断。
+#
+# ⚠️ 型号名差一个字母就是另一个晶体，必须逐字核对：
+#     AR40e (Sensar 1-piece, Haigis a0=+0.472, n=368)
+#     AR40E (Sensar 3-piece, Haigis a0=-2.42,  n=653)
+#     Softec HD  (有 optimized 常数, n=5208)
+#     Softec HDO (无 optimized 常数，是另一个型号)
+lenses:
+  - name: ZCB00
+    key: Johnson and Johnson Vision ZCB00
+
+  - name: MX60
+    key: Bausch + Lomb enVista
+
+  - name: NS-60YG
+    key: Nidek NS-60YG
+
+  - name: Softec HD
+    key: Lenstec Softec HD
+
+# ---------------------------------------------------------------- 计算口径
+calculation:
+  # 目标屈光度（D）：术后希望达到的屈光状态
+  target_refraction: -0.5
+  # 度数档位步长（D）
+  step: 0.5
+
+# ---------------------------------------------------------------- 数据源
+# 常数表路径（相对本文件目录，或绝对路径）
+constants_file: iolcon_constants.json
+
+# MDB 路径（设备活库，Jet 4）
+# ⚠️ IolmXP.MDB 是 IOLMaster 500 的库结构。IOLMaster 700 是 CZM_*.MDB，
+#    结构完全不同，直接指过来会读不到数据，也不保证字段语义一致。
+mdb_path: /path/to/IOLData/IolmXP.MDB   # 按现场实际路径改
+
+# ---------------------------------------------------------------- 推送目标
+push:
+  # 纯 DICOM C-STORE，不依赖任何厂商 REST 接口
+  dicom_host: 127.0.0.1
+  dicom_port: 4242
+  # 目标 AE Title（Orthanc 默认 ORTHANC；换别的 PACS 改这里）
+  ae_title: ORTHANC
+
+# ---------------------------------------------------------------- 报告单
+report:
+  study_description: IOLMaster 晶体单
+  institution: ""    # 页眉机构名。留空则不印院名（避免把具体医院写进仓库）
+  department: 眼科
+  manufacturer: Carl Zeiss Meditec
+  model: IOLMaster 500
+  device_serial: ""
+  station_name: ""
+  software_version: "V. 5.5"
+
+# ---------------------------------------------------------------- 性能
+performance:
+  # 并发进程数（不是线程数 —— 渲染/JPEG 编码不释放 GIL，线程池反而更慢）
+  #
+  #   1    串行。排障用，单核机器也选这个
+  #   4    默认。单例 406ms → 约 275ms，对 PACS 压力可控
+  #   8    大机器。约 190ms/例，但会开 8 条并发 C-STORE 关联
+  #
+  # 瓶颈是推送的网络等待（占单例 68%），所以 4→8 的收益只有 1.27×，
+  # 不是线性的。内存约 100MB/进程。
+  #
+  # 合法范围 1..16。装载阶段校验：非整数、负数、0、超上限、带小数
+  # 都会直接报错退出，不会静默兜底（配错要在启动时暴露）。
+  #
+  # 命令行 --workers 会覆盖这里的值。
+  workers: 4
+
+# ---------------------------------------------------------------- 轮询
+watcher:
+  interval_seconds: 60      # MDB mtime 检查间隔
+  max_seconds: 300          # 单轮时间预算
+
+  # ★ 落盘稳定性判定：mtime 变了不等于写完了。
+  #   设备写 Access 库时 mtime 先变、页还在刷，此时读可能拿到半写入的
+  #   浮点字节，按错误度数出单推给 PACS。所以先等文件「指纹」
+  #   (mtime_ns, size) 连续 settle_seconds 秒不变，才开始读。
+  #
+  #   settle_seconds          连续多久不变算稳定。默认 5
+  #   settle_timeout_seconds  最多等多久。超时就跳过本轮，下轮再看。默认 120
+  #
+  #   代价：每次 MDB 有更新，出单延迟多 settle_seconds 秒。
+  #   调小有风险（可能读到中间态），调大只是慢。
+  settle_seconds: 5
+  settle_timeout_seconds: 120
+
+  # ★ 冷却期（秒）：一条检查从「最早能确定它已存在」到「允许推送」要等多久。
+  #
+  #   为什么需要：MDB 是**可变快照**，设备没有「这次检查已结束」这个事件。
+  #   操作员常常先测角膜曲率、十几分钟后再补眼轴，补测是**改写同一行**
+  #   （guid 不变）。管线如果看到就推，推出去的会是「只有 K 没有 AL」的
+  #   半成品 —— 而且此后该病例会被 state 记成已完成，再也不会更新。
+  #
+  #   起点 = 该行在设备上的**创建时刻**（guid 内嵌的 YYMMDDHHMMSSmmm）。
+  #   补测不改 guid，所以这个时刻不会变 —— 冷却保证的是「距首次测量至少
+  #   cooling_seconds」，**不**保证「每一版内容都稳定这么久」。第 19 分钟
+  #   补测的检查，第 20 分钟就会发出去；那种情况靠内容指纹 + audit 兜底。
+  #   只有创建时刻无法解析（guid 格式变了）时，才退回用「这版内容首次被
+  #   扫描看到的时刻」兜底。
+  #
+  #   代价：新检查进 PACS 晚 cooling_seconds 秒。0 = 关闭（不推荐）。
+  #   现场实测：本例 11:02 首测 → 11:13 补眼轴，跨度 11 分钟。
+  cooling_seconds: 1200
+
+# ---------------------------------------------------------------- PACS 未就绪怎么办
+# 医院开机顺序不受控：DICOM 服务端（Orthanc / PACS）常常比本管线晚起来
+# 几十秒到几分钟。**不可达不等于放弃** —— 常驻管线会原地守候，按下面的
+# 间隔反复探测，一通就立刻把积压补推上去；等多久都不丢，因为每轮都是
+# 基于全库重新筛选待办（state 只记「已完成」）。
+watchdog:
+  # 不可达时的探测间隔（秒）。越短恢复越快，代价只是日志和一次 TCP 连接。
+  probe_seconds: 15
+
+  # 单次 TCP 连接超时（秒）。主机不存在时靠它快速失败。
+  connect_timeout: 3
+
+  # C-ECHO 超时（秒）。要明显短于 pynetdicom 默认的 30s，否则「端口开着
+  # 但 DIMSE 不应答」的半起状态会让一次探测卡两分钟，守候形同虚设。
+  cecho_timeout: 5
+
+  # 是否要求 C-ECHO 必须成功才算「在线」。
+  #   false（默认）TCP 通就算在线 —— 有些老 SCP 不实现 Verification
+  #               SOP Class，照样能收 C-STORE，要求 C-ECHO 会永远推不上去。
+  #   true       更严格：适合确认支持 C-ECHO 的 Orthanc/dcm4chee。
+  require_cecho: false
+
+  # 不可达期间每探测多少次打一行「仍在守候」日志（默认 20 次 ≈ 5 分钟）。
+  # 不节流的话一晚上能刷几千行。
+  log_every: 20
+
+# ---------------------------------------------------------------- 单例失败退避
+# 推送失败 / 部分成功 / 渲染失败的病例进 failed 队列，按指数退避重试。
+# 不退避的话，PACS 半通（端口开、关联被拒）时每轮会把几百例重渲一遍。
+retry:
+  initial_seconds: 60      # 第 1 次失败后等多久
+  factor: 2                # 之后每次 ×2
+  max_seconds: 900         # 封顶 15 分钟（60→120→240→480→900→900…）
+
+  # 注意：确定失败（库里没生日、计算失败）标记 permanent，不再重试 ——
+  # 这类重试一万次也不会有不同结果，只会每轮刷同一条日志。
+  # 改配置或改型号会让 state 签名变化，重置后它们会重新尝试一次。
