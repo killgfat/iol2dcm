@@ -29,10 +29,12 @@
 本仓库**不含**任何患者数据：没有 MDB 活库、没有 `.iol`、没有 DICOM 实例、
 没有渲染出的报告单。`.gitignore` 对这些类型做了强制排除。
 
-但运行时会落盘患者身份信息（姓名、生日、检查日期、PatientID）——
-`/var/lib/iol2dcm/state.json` 与 `/var/log/iol2dcm.log`。日志默认
-**不脱敏**，便于现场核对原厂报告单。部署方必须自行落实访问控制与备份
-加密，并确保排障时外传的日志已做脱敏。详见 README「患者信息与隐私」。
+运行时会把患者身份信息（姓名、生日、检查日期、PatientID）写入
+`/var/lib/iol2dcm/state.json`。常驻流程日志使用稳定的一次性患者标签替代姓名，
+但仍包含检查日期和 PatientID。`audit` 默认同样只输出标签，加 `--show-ident`
+才打印明文姓名；`render`、`check` 是交互式排障命令，会在终端输出姓名（渲染
+出的 PNG 文件名使用标签）。部署方必须自行落实访问控制与备份保护，并确保
+排障时外传的状态文件、命令输出和日志均已脱敏。详见 README「患者数据与隐私」。
 
 ### 关于本声明所依据的事实
 
@@ -44,7 +46,7 @@
 | 表名 `IolmMeasurements` | 实测该库存在此表 |
 | 字段 `al_r/al_l`、`r1_r/r1_l`、`r2_r/r2_l`、`acd_r/acd_l`、`axis_r/axis_l` | 与设备原厂报告单逐例核对一致 |
 | K = 337.5 / r | 用真实报告单反算验证（两眼 K1/K2 共 4 个值全部吻合到 0.01 D） |
-| 未测出字段存 0 而非 NULL | 实测统计（acd 仅 33% 有值，lens_thickness 全为 0） |
+| 未测出字段存 0 而非 NULL | 验证样例库实测（acd 仅约三分之一有值，lens_thickness 全为 0） |
 
 **这些事实不自动适用于其他机型。** IOLMaster 700 使用不同的数据库结构
 （`CZM_*.MDB` 系列而非 `IolmXP.MDB`），字段名、单位、编码方式均可能不同，
@@ -90,10 +92,13 @@ files, no DICOM instances, no rendered reports. `.gitignore` enforces these
 exclusions.
 
 At runtime, patient identifiers (name, date of birth, exam date, PatientID)
-are written to `/var/lib/iol2dcm/state.json`. Operational log messages use a
-stable one-way patient label instead of the name, but still contain dates and
-PatientIDs. Deployers remain responsible for access control, backup encryption,
-and de-identifying any state or log excerpt shared for troubleshooting.
+are written to `/var/lib/iol2dcm/state.json`. Service log messages use a stable
+one-way patient label instead of the name, but still contain dates and PatientIDs.
+`audit` also prints labels by default and only shows names with `--show-ident`.
+`render` and `check` are interactive troubleshooting commands and do print names
+to the terminal (rendered PNG filenames use labels).
+Deployers remain responsible for access control, backup protection, and
+de-identifying any state, command output, or log excerpt shared for troubleshooting.
 
 ### Basis for this statement
 
@@ -106,7 +111,7 @@ producing `IolmXP.MDB`:
 | Table `IolmMeasurements` | Observed to exist in that database |
 | Columns `al_r/al_l`, `r1_r/r1_l`, `r2_r/r2_l`, `acd_r/acd_l`, `axis_r/axis_l` | Verified item-by-item against native device reports |
 | K = 337.5 / r | Back-computed from real reports (all 4 K1/K2 values across both eyes matched to 0.01 D) |
-| Unmeasured fields stored as 0, not NULL | Field statistics (acd present in only 33%, lens_thickness all zero) |
+| Unmeasured fields stored as 0, not NULL | Observed in the validation sample (acd present in roughly one third of rows, lens_thickness all zero) |
 
 **These facts do not automatically transfer to other models.** The IOLMaster 700
 uses a different database schema (the `CZM_*.MDB` series rather than

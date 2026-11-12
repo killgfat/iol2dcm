@@ -1,5 +1,21 @@
 # DICOM 输出规范
 
+本文面向需要在 PACS 中核对结果、或修改 DICOM 封装的读者。可以把输出理解为
+两类内容：**给人看的报告图**，以及**给其他系统读取的结构化测量值**。
+
+| 缩写 | 含义 | 在本项目中的作用 |
+|---|---|---|
+| SC | Secondary Capture，二次捕获图像 | 每款晶体一张 A4 报告图 |
+| OAM | Ophthalmic Axial Measurements | 眼轴 AL 和可选的前房深度 ACD |
+| KER / Keratometry | 角膜曲率测量 | K1/K2、r1/r2 和散光轴位 |
+| AL | Axial Length，眼轴长度 | 生物测量输入，单位 mm |
+| ACD | Anterior Chamber Depth，前房深度 | 生物测量输入，单位 mm |
+| K | Keratometric Power，角膜曲率屈光力 | 单位 D；由半径 r 换算 |
+| study / series / instance | 检查 / 序列 / 实例 | 一次检查包含多个 series，每个 series 在本项目中有一个实例 |
+
+一次完整检查的输出是 `N 个 SC + 1 个 OAM + 1 个 KER`，N 为配置的晶体款数。
+缺少测量值时不补 0、不造空实例，按下表只发有依据的内容。
+
 ## study / series 组织
 
 一次检查 = 1 个 study：
@@ -43,7 +59,7 @@ Measurements Storage / Keratometry Measurements Storage 的 PACS / 工作站都�
 角膜曲率**不能**塞进 OAM。Ophthalmic Axial Measurements IOD 里根本没有
 K 值、曲率半径、散光轴位这三个属性 —— 硬加就是非法属性，严格的 PACS
 会整条拒收。标准给它们留的位置是独立的 Keratometry Measurements
-Storage（78.3，C.8.25.10 模块）。详见 [keratometry](#keratometry-实例内容)。
+Storage（78.3，C.8.25.10 模块）。详见 [KER 实例内容](#ker-实例内容)。
 
 ## SC 实例的 tag 策略
 
@@ -118,7 +134,7 @@ item[1]  Type = SEGMENTAL LENGTH   → SegmentalLengthSequence  ACD = 3.12 mm
 Intraocular Lens Calculations IOD（C.8.25.16.2 的
 `AnteriorChamberDepthSequence` 0022,1128），本 IOD 里没有它。
 
-ACD 缺失（实测只有 33% 的检查测了 ACD）时**只发一个 item**，
+ACD 缺失时**只发一个 item**，
 不塞 0 也不塞空段 —— 没测就是没测。
 
 ### 眼状态：原文直封，不做翻译
@@ -139,23 +155,6 @@ CodeMeaning            = 原文全文
 
 原文本身就是事实，直接落库最省事也最准确。下游要用 SNOMED 就自己按 CodeMeaning 去做。
 
-实测取值分布（全库 × 双眼）：
-
-```
-有晶状体                  17093
-None（未填）              13497
-硅油充填眼                    46
-硅油充填眼，有晶状体              29
-无晶状体                      24
-硅油填充眼，无晶状体               5
-Phakic                     4
-无晶状体硅油填充眼                4
-人工晶状体PMMA                 1
-假晶状体硅油充填眼                1
-硅油充填眼，人工晶状体              1
-人工晶状体丙烯酸酯                1
-```
-
 字段归属：MDB 只有一列 `state` 混记晶状体与玻璃体状态。原文里提到玻璃体的
 （含「硅油」「气体」「玻切」「玻璃体」等词）才写进 Vitreous 字段，否则写 `None`。
 这是字段归属判断，不是语义翻译。
@@ -169,7 +168,10 @@ Phakic                     4
 
 只用 **DICOM C-STORE**，不依赖任何厂商 REST 接口。
 
-一次关联推完整个 study（N+2 个实例：N 张晶体单 + OAM + KER）。传输语法策略：
+一次关联推完整个 study。数据齐全时是 N+2 个实例（N 张晶体单 + OAM + KER）；
+缺数据时按有效测量确定应发集合；完整生成并持久化后才发，全部实例明确成功
+才提交该轮。补测的 SC/OAM/KER 名称统一加 Rec N，为该轮派生新 Series/SOP
+UID，Study UID 不变。传输语法策略：
 
 ```
 先试 JPEG Baseline   → 约 640 KB/张
@@ -230,6 +232,6 @@ MDB 只存一列 `axis_r` / `axis_l`，它是 **K1（r1 那条子午线）的轴
 | 中文姓名落库成 `?` | 缺 `SpecificCharacterSet` | 设为 `ISO_IR 192` |
 | `No presentation context ... has been accepted` | 内存 dataset 的 `original_encoding` 恒为 Implicit VR | 推前按 `file_meta` 设好 `_read_implicit` / `_read_little` |
 | 花屏 | 目标端不认 JPEG | 回退裸像素重推 |
-| 改版重推不生效 | Orthanc 对同 SOP UID 静默去重 | 提升 `dicom.PRIVATE_CREATOR` 版本号，UID 随之变化 |
+| 补测重推不生效 | 同 SOP UID 会静默去重 | v1.3.4 自动新增 Rec N，Series/SOP UID 同时更新；禁止删 state 强推，见 [补测轮次说明](rec-rounds.md) |
 | 无像素实例推送抛 `AttributeError: TransferSyntaxUID` | OAM / KER 未声明传输语法 | 显式设 `ExplicitVRLittleEndian` |
 | 一个实例失败后整个 study 都不推了 | `send_c_store` 在 SCP 拒绝传输语法时抛 `ValueError`，原先没捕获 | 已捕获并转入 JPEG → 裸像素回退 |

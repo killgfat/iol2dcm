@@ -1,5 +1,22 @@
 # 运维
 
+本文按现场任务组织。新部署先完成 [README 的快速开始](../README.md#快速开始)，
+再用本页处理维护与异常。
+
+| 我要做什么 | 看哪一节 |
+|---|---|
+| 安装、重装或只改一个安装参数 | [安装](#安装) |
+| 查看服务、日志或运行自检 | [日常命令](#日常命令)、[运维子命令](#运维子命令) |
+| 确认 PACS 是否可推送 | [probe](#只看-pacs-通不通probe) |
+| 修改晶体或更新常数 | [配置](#配置只有一个来源)、[常数表更新](#常数表更新手工没有定时任务) |
+| 新检查迟迟没进 PACS | [冷却期与补测](#冷却期与补测v131-起)、[常见故障](#常见故障) |
+| 补测后 PACS 仍是旧内容 | [只读审计](#审计找出-state-与真实数据不一致的病例)、[定点修复](#定点修复单个病例推荐) |
+| 首次上线处理历史检查 | [全量回填](#全量回填) |
+| 备份现场数据与进度 | [备份](#备份) |
+
+以下命令默认安装在 `/opt/iol2dcm`。涉及患者姓名、日期、state 或日志的输出
+均属于敏感信息，不要在 issue 或聊天工具中直接外发。
+
 ## 安装
 
 ```bash
@@ -7,8 +24,10 @@ git clone https://github.com/killgfat/iol2dcm /root/iol2dcm && cd /root/iol2dcm
 sudo bash install.sh          # 逐项提问，回车用默认值
 ```
 
-装完**自动启动**，不需要任何人工干预 —— 这是一条自动运行的管线。
-自检不通过会 `exit 1`，不带病启动。
+装完**自动启动**，日常不需要手工运行命令。自检不通过会 `exit 1`，不带病启动。
+
+> 首次启动时 state 为空，会自动处理 MDB 中全部历史检查，并非只等待新检查。
+> 上线前请先阅读[全量回填](#全量回填)，评估数据量与 PACS 压力。
 
 ### 三种装法
 
@@ -139,6 +158,7 @@ $P pipeline.py check                    # 自检各环节
 $P pipeline.py probe                    # 只探 DICOM 目标（TCP + C-ECHO）
 $P pipeline.py probe --json             # 同上，JSON（给监控/cron 用）
 $P pipeline.py lenses                   # 看当前上表型号与常数
+$P pipeline.py audit                    # 只读审计：核对 state 与当前 MDB
 $P pipeline.py render --patient 张三 --date 20250101 --outdir /tmp/out
 $P pipeline.py run --limit 5            # 手动补一轮
 $P pipeline.py constants                # 更新常数表
@@ -153,8 +173,8 @@ $P pipeline.py constants                # 更新常数表
 报告单渲染
   ✓ 中文字体: 思源黑体
 数据源
-  ✓ 库结构: IolmMeasurements 表校验通过，必需字段齐全
-  ✓ MDB 解码: 全库检查记录
+  ✓ 库结构: IolmMeasurements，必需字段齐全
+  ✓ MDB 解码: 检查记录读取成功
 计算与封装
   ✓ 端到端试跑: PNG 203KB, SC 2338×1654, OAM Modality=OAM
 推送目标
@@ -259,50 +279,58 @@ sudo bash install.sh --pacs pacs.example.org:4242 --update-config
 
 `/var/lib/iol2dcm/state.json`：
 
+以下为合成的旧版状态结构示例，标识、日期及指纹均为虚构，不可作为实际 state 使用。
+
 ```json
 {
-  "sig": "Johnson and Johnson Vision ZCB00|Bausch + Lomb enVista|...",
+  "key_scheme": "row-v1",
+  "sig": "layout-version||synthetic:Test A|synthetic:Test B|synthetic:Test C|synthetic:Test D",
   "done": {
-    "张|伟|20250101": {
-      "t": "2026-11-06 21:49:37",
-      "pid": "I19700101EA08",
+    "synthetic-guid-a|20000102": {
+      "t": "2000-01-02 00:00:00",
+      "pid": "SYNTHETIC-PATIENT-A",
       "src": "generated",
-      "date": "20250101",
+      "date": "20000102",
       "sc": 4,
-      "lenses": ["ZCB00", "MX60", "NS-60YG", "Softec HD"],
+      "lenses": [
+        "Test A",
+        "Test B",
+        "Test C",
+        "Test D"
+      ],
       "oam_eyes": 2,
       "ker_eyes": 2,
       "instances": 6,
-      "fp": "97e3faa9f2311176"
+      "fp": "0000000000000001"
     },
-    "李|娜|20250102": {
-      "t": "2026-11-06 21:49:40",
-      "pid": "I19800202B31C",
+    "synthetic-guid-b|20000102": {
+      "t": "2000-01-02 00:00:01",
+      "pid": "SYNTHETIC-PATIENT-B",
       "src": "generated",
-      "date": "20250102",
+      "date": "20000102",
       "sc": 0,
       "lenses": [],
       "oam_eyes": 2,
       "ker_eyes": 0,
       "instances": 1
     },
-    "王|五|20250103": {
-      "t": "2026-11-06 21:49:41",
-      "pid": "I19900303D77A",
+    "synthetic-guid-c|20000102": {
+      "t": "2000-01-02 00:00:02",
+      "pid": "SYNTHETIC-PATIENT-C",
       "src": "empty",
-      "date": "20250103",
+      "date": "20000102",
       "n": 0
     }
   },
   "failed": {
-    "李|娜|20250102": {
-      "t": "2026-11-07 08:12:04",
-      "err": "部分成功 3/5: 1.2.840… 0x0122",
+    "synthetic-guid-d|20000102": {
+      "t": "2000-01-02 00:01:00",
+      "err": "部分成功 3/5: <synthetic-sop-uid> 0x0122",
       "tries": 3,
-      "next": 1730956800.0
+      "next": 946684920.0
     },
-    "王|五|20250103": {
-      "t": "2026-11-07 08:12:05",
+    "synthetic-guid-e|20000102": {
+      "t": "2000-01-02 00:01:01",
       "err": "无生日，无法生成 PatientID",
       "permanent": true,
       "tries": 1,
@@ -327,24 +355,33 @@ sudo bash install.sh --pacs pacs.example.org:4242 --update-config
   扫描时会被清掉重新处理（**不**补指纹），无论有没有 `fp`
 - `sc` / `oam_eyes` / `ker_eyes` 记录本条实际发了什么。缺 AL 或缺 K
   的病例 `sc` 为 0（不出晶体单），能从 state 一眼看出来
-- 每 25 例原子写一次（`tmp` + `fsync` + `rename`），断电最多丢 25 例进度
-- `failed` 里的记录按指数退避重试：`tries` 是失败次数，`next` 是下次
-  可重试的绝对时间戳（epoch 秒）。到点之前**不会**重新渲染那一例。
-- `permanent: true` 表示确定失败（库里没生日、计算失败），不再重试。
-  改配置或改型号会让 `sig` 变化、state 整体重置，它们会重新尝试一次。
-- `failed` 指向的检查如果已从设备库里归档掉，下一轮会被自动清理。
-  `cooling` / `stale` 同样清理，避免 state 无限膨胀。
-- `cooling`：`key -> {fp, first, ready}`，冷却中的检查。只放窗口内的条目，
-  推成功后立即删除，稳态规模很小。`ready` 是到期时刻，`loop()` 靠它唤醒。
-- `stale`：`key -> {was_fp, now_fp, was, now_instances}`，设备补测过但
-  PACS 里还是旧版的病例，等人工确认。**这是需要人看的**，不是自动重试队列。
-- `sig` 只由 `INSTANCE_LAYOUT` + 型号 key 拼成（**不含** `PRIVATE_CREATOR` /
-  `LAYOUT_VERSION`，也不含数据内容）。换型号、或升级到「缺数据只出结构化
-  实例」这类改动时，全部作废重推一次（旧记录里的 `done` 是在旧口径下判的）
+- v1.3.4 在发送前持久化 pending（冻结输入、配置、轮次和目标），完整 DICOM
+  载荷原子发布到 <state路径>.spool/；父进程再持久化 ready 后才 C-STORE。
+  全部实例明确返回 0x0000 后立即持久化新的 done。
+- done.revision 是最新完整轮次；旧记录没有该字段时按第 1 轮处理。
+  done.history 留下此前完整轮次的指纹和实例数，不用于重复发送。
+- failed 的 tries / next 沿用指数退避；有 pending 时重试相同载荷，
+  不分配新轮次，也不拿当前 MDB 覆盖待完成版本。
+- permanent 表示当前轮次已暂停；载荷丢失/损坏、C-STORE Warning 保留 pending，
+  告警且不能通过设备继续补测绕过。
+- pending 对应行即使从设备库归档也继续补齐；仅无载荷且无接收历史的孤儿失败可清理。旧 stale/接收历史保留告警。
+- cooling 除新检查冷却外，也用于唤醒完成冻结版本后的最新数据扫描，
+  以及 --limit / 时间预算没轮到的检查，避免等不到下一次 MDB 更新。
+- stale 中普通补测（含无 from 的旧记录）在下轮自动转入 Rec N；
+  空测量值、身份冲突、旧部分接收而缺少原始载荷仍告警安全暂停。
+- sig 仍只由 INSTANCE_LAYOUT + 型号 key 拼成，本次没有修改该签名、
+  KEY_SCHEME、PRIVATE_CREATOR、OAM/KER LAYOUT_VERSION。
+  签名变化现在报错停止，禁止自动丢弃历史后全量重推。
 
-**怎么让它立刻重试**：把某条的 `next` 改成 0（或删掉这条记录），重启服务即可。
+重试遵循 next；需立刻重试时先停服务并备份一致的 state 与 spool，再将
+对应 failed.next 设为 0。不要删除 done / pending / stale 或载荷。
+对永久失败先修复根因；载荷丢失应恢复一致备份，不能删除条目强行跳过。
 
 ### 冷却期与补测（v1.3.1 起）
+
+> v1.3.2 补充：本节说的「补测改写同一行、guid 不变」是冷却期成立的前提。
+> 反过来说，**同组多行就不可能是版本序列**——那是多条独立记录。选行不能用
+> 「谁后建」，见下文的[同组多行与选行口径](#同组多行与选行口径v132-起)。
 
 MDB 是**可变快照**：设备没有「这次检查已结束」这个事件。操作员常常先测
 角膜曲率、十几分钟后再补眼轴，而补测是**改写同一行**（guid 不变）。
@@ -367,7 +404,6 @@ config 模板里 —— 已装机器的旧 `config.yaml` 没有这个字段，�
 
 - 历史积压不受影响：几个月前的检查创建时刻早已超窗，照常立刻推。
 - 代价：新检查进 PACS 晚 20 分钟。设 0 可关闭（不推荐）。
-- 现场实测：某例 11:02 首测 → 11:13 补眼轴，跨度 11 分钟。
 
 **2. 补测后不能被永久冻结 —— 内容指纹**
 
@@ -375,14 +411,17 @@ config 模板里 —— 已装机器的旧 `config.yaml` 没有这个字段，�
 下一轮比对的是**内容**，不再是「这例处理过没有」。
 
 - 指纹一样 → 真·已推过，跳过（幂等照旧）
-- 指纹不同 → 设备补测过，写进 `state.stale` 并告警，**不自动重推**
+- 指纹不同 → 同一 study 新增完整的 Rec 2 / Rec 3，SC、OAM、KER 的
+  SeriesDescription 都加相同后缀，例如 IOL Repo DCB00 Rec 2。
+  SeriesInstanceUID 和 SOPInstanceUID 同时按轮次派生，旧轮次留在 PACS。
+- 补测过程中再次变化 → 先补齐持久化的当前轮次，再扫描并排下一轮。
+  数据回到更早的历史版本仍新增下一轮，不能把历史版误当成最新轮次。
 
-为什么不自动重推：OAM/KER 的 SOP Instance UID 只由 study + 布局版本派生，
-不含内容。同 UID 不同内容推上去，PACS 默认保留首个并**返回成功** —— 结果
-是「推送成功、state 记 6 实例齐全、PACS 里还是旧版单眼图」，比卡住更难查。
+本策略不调用 REST、不删除或覆盖 PACS 数据。首轮 UID 保持历史公式。
+网络失败重试复用同轮 UID 和持久化载荷，避免静默去重吞掉新版。
 
 **升级兼容**：本改动之前写的 `done` 没有 `fp`。首次扫描时会把**当前**
-内容就地补写成指纹、**不重推**（否则升级即全量重推，而 PACS 会
+内容就地补写成指纹、**不重推**（否则升级可能触发历史记录全量重推，而 PACS 会
 按同 SOP UID 静默去重，白打网络且给不出新内容）。代价：升级前已经发生的
 补测查不出来，用 `audit` 核对。
 
@@ -393,63 +432,167 @@ config 模板里 —— 已装机器的旧 `config.yaml` 没有这个字段，�
 /opt/iol2dcm/venv/bin/python /opt/iol2dcm/pipeline.py audit
 ```
 
-输出四类：
+输出：
 
-| 分类 | 含义 |
-|---|---|
-| 内容已变 | 设备补测过，PACS 里是旧版（本次事故的形态） |
-| 实例数不符 | 按当前数据重算，与 `done` 里记的对不上 |
-| 无指纹 | 老记录，无法判断是否陈旧（退化到只比实例数） |
-| 库中已无对应检查 | 设备归档/清库，可安全清理 |
-| 从未真正发送过（dry/empty） | 历史污染记录，一个实例都没发过。**下次扫描会自动清掉重扫**，不需要人工介入，也不计入结论。列入本表只为说明「PACS 里没有它」 |
+| 分类 | 含义 | 计入结论 |
+|---|---|---|
+| 内容已变 | 设备补测过，PACS 里是旧版 | ✔ |
+| 实例数不符 | 按当前数据重算，与 `done` 里记的对不上 | ✔ |
+| 已推内容现在没有有效测量值 | 记录发过实例，但当前选中的行没有 AL、也没有成对 r1+r2。明细里标注**有/无指纹**：无指纹表示「PACS 里是哪一版未知」 | ✔ |
+| PatientID 与当前选中的行不一致 | 同组多行生日不同，PACS 里已有的是旧 PID。再推会新建一个患者档案 | ✔ |
+| 无指纹 | 老记录，无法判断是否陈旧（退化到只比实例数） | ✘ |
+| 同日同名多行 | 列出组内每行的空/有值、`当天` 或采集日、生日、`*` 标记实际选中的行。**只读提示** | ✘ |
+| 库中已无对应检查 | 普通 done 仅提示；pending 继续补齐，旧 stale/接收历史保留告警 | 有异常记录则 ✔ |
+| 从未真正发送过（dry/empty） | 历史污染记录，一个实例都没发过。**下次扫描会自动清掉重扫**，不需要人工介入 | ✘ |
 
 退出码 0 = 未发现不一致，1 = 有问题。适合放进 cron 每天跑一次。
 
-### 想强制重推
+### 一行一个案例（v1.3.3 起）
+
+**幂等键从 `姓|名|检查日期` 改成 `guid|检查日期`。**
+
+旧键把「同一天」当成一次检查，同一天测两轮只能留一行，另一轮被丢掉或被覆盖。
+新口径：**一行 = 一个独立案例**。同天两轮各自成案例、各自出单，互不覆盖。
+
+选键原则：同 guid 可以对应多个 exam_date；姓名与生日也不能唯一标识一条
+检查记录。因此使用 guid|exam_date 区分案例，避免以姓名分组覆盖独立记录。
+
+#### 迁移（自动，一次性）
+
+`run_once` 与 `audit` 都会调 `_migrate_keys()`，靠 state 里的 `key_scheme`
+标记判断是否已迁移。规则：
+
+| 情况 | 处理 |
+|---|---|
+| 单行组 | 那一行直接继承原 done 记录（fp / pid / instances 全保留） |
+| 多行组 | 用「PACS 里那份来自哪一行」找出继承行，其余行作为全新案例 |
+| 库中找不到（孤儿） | **保留原键不动**，计数上报，绝不删除 |
+
+**为什么不会重推**：继承的记录带 `uid_seed: ""`，`study_uid_for(pid, date, "")`
+与旧公式完全一致 —— 算出来的 study / series / SOP UID 与当年推的一模一样。
+指纹也对得上，于是走「内容没变」分支跳过。
+
+**为什么新案例不会撞 UID**：新案例的 `uid_seed` 是它自己的 guid，
+`study_uid_for(pid, date, guid)` 是一个全新 study，SC/OAM/KER 的 UID 全部跟着变。
+
+#### 部署前先预演
 
 ```bash
-systemctl stop iol2dcm
-rm /var/lib/iol2dcm/state.json      # 或只删某几条
-systemctl start iol2dcm
+cp /var/lib/iol2dcm/state.json /tmp/verify_new/state_copy.json
+python3 /tmp/verify_new/tools/verify_before_deploy.py \
+    --mdb /storage/iolmaster/IOLData/IolmXP.MDB \
+    --state /tmp/verify_new/state_copy.json --src /tmp/verify_new
 ```
 
-只删部分记录：编辑 JSON，删掉 `done` 里对应的 key（以及 `stale` 里
-同一 key）。
+预演只读，不写 state、不推 PACS。核对单行组是否原样继承、多行组是否只
+选择正确来源行，以及新增案例数量是否符合待迁移数据；数量以各部署为准。
+部署后核对迁移日志中的改名、拆分及新增案例计数，不使用固定预期值。
 
-⚠️ **注意 Orthanc 对同 SOP UID 会静默去重**：同 UID 不同内容推上去，
-它保留首个并返回成功。所以**只删 state 再重推是拿不到新内容的**，
-必须先删 PACS 旧实例。
+⚠️ **回滚代价**：迁移会改写 state 的键空间。要回滚到 1.3.2，必须同时还原
+state 备份，否则旧代码认不出新键、会把整库当成没推过而全量重推。
 
-⚠️ **提升版本号不是定点修复手段，而且两种版本号后果不同**：
+---
 
-| 改什么 | `sig` 变吗 | 实例 UID 变吗 | 后果 |
-|---|---|---|---|
-| `INSTANCE_LAYOUT` | **变** | 不变 | state 整体作废 → 全量重推；但 UID 不变，PACS 全部静默去重 → **白跑一遍，什么也没改** |
-| `PRIVATE_CREATOR` / `LAYOUT_VERSION` | 不变 | **变** | 已推的不会自动重推；但以后任何重推都产生新 UID → PACS 里**凭空多出整套同名 series**（实测：同一 study 下第 2 个 OAM + 第 2 个 KER） |
+### 同组多行与选行口径（v1.3.2 起，v1.3.3 已由「一行一案例」取代）
 
-（`sig` 实际只由 `INSTANCE_LAYOUT` + 型号 key 拼成，见 `_load_state`。）
+旧版按组选择最新记录时，可能选中创建较晚的空行，导致有数据的已推记录
+无法补写指纹。以下说明保留的旧选行接口；当前管线按行处理独立案例。
 
-### 定点修复单个病例（推荐）
+v1.3.2 起选行改用 `sources.mdb.pick_row()`，返回 `(行, 结论)`：
 
-这正是 `stale` 的处理流程。`stale` 是**持续生效的人工闸门**：只要内容还没
-变回 PACS 里已有的那一版，管线就不会自动重发它（不管触发源是别的患者的
-MDB 更新、手动 `run` 还是服务重启）。
+| 结论 | 什么时候 | 管线怎么做 |
+|---|---|---|
+| `OWN` | 当天采集、有测量值 | 直接出单 |
+| `OTHER` | 当天有记录但没测出值 | 判「本次就诊尚无数据」，不出单 |
+| `EMPTY` | 整组没有可录入的测量值 | 跳过 |
+| `PUSHED` | **仅限已推记录**：PACS 里那份的来源行 | 只比对 / 补写指纹，永不推送 |
 
-```bash
-# 1. 看清单（只读）
-/opt/iol2dcm/venv/bin/python /opt/iol2dcm/pipeline.py audit
+**判断「当天」看 guid 内嵌的采集日期是否等于 `exam_date`**，不是看
+`measure_ts` 谁大。日期不同可能表示同次采集挂到不同业务日期，不能只按创建时间判断来源。
 
-# 2. 在 PACS 上删掉该 study 的旧实例
-#    Orthanc：DELETE /studies/<studyUID>（或按 series 精确删）
+⚠️ **已推过的记录走另一套口径**：问的不是「该用哪行出单」，而是「PACS 里那份
+是哪行推出去的」——空行产不出实例，所以必然是**有测量值**那行。这条路径只用于
+比对/补写指纹，永不触发推送。
 
-# 3. 删掉 state.json 里该 key 的 done 与 stale 条目，重启服务
-systemctl restart iol2dcm
+需要知道的四件事：
 
-# 4. 再跑一次 audit 确认结论变成「未发现不一致」
-```
+1. `pick_latest()` 与 `pick_best()` 的行为保持兼容，供外部脚本调用；
+   当前管线逐行处理，审计与旧键迁移使用 `pick_row()` 判断来源。
+2. 同组两行都有测量值、**生日又不同**时，按采集时刻选最新、照常处理，
+   并在日志里留一行「已推记录与当前行的 PatientID 不同」。
+   使用者口径：数据对不上就不硬核对，**当两条独立记录**处理。
+   所以这种情况不进 `stale`、不进 `audit` 的结论项，也不需要人跟进。
+3. `audit` 有一节「采集日期与检查日期不同」—— **只读提示，不计入结论**。
+   设备的正常行为（把一次测量挂到某个就诊日期下），不再因此拦单。
+4. 同日同名两行**生日不同**，当两条独立记录处理，不做核对、不进待办。
+   `audit` 的「同日同名多行」会把两行的生日都列出来，仅供人自己看。
 
-**为什么必须先删旧实例**：OAM/KER 的 SOP Instance UID 只由 study + 布局
-版本派生，不含内容。不删的话重推会被静默去重，账目却记成成功。
+**v1.3.3 已删除 `max_stale_days`。** 旧模型按 (姓,名,日期) 归组选一行，可能
+选到几个月前采的那行，才需要「跨天就别推」的闸门。一行一个案例之后，这一行
+就是它自己那次检查，采集日与 `exam_date` 不同是设备的业务行为 —— 按每行自己的
+数据走既有的「信息是否充足」判定即可。该闸门可能误拦独立案例，因此已移除。
+
+### 补测自动成轮（v1.3.4）
+
+日常补测无需手工操作。旧 done + stale 存在且当前有效测量已变化、身份
+一致时，服务启动扫描就生成 Rec 2；成功后清理该 stale，保留历史实例。
+后续变化生成 Rec 3，以此类推。相同指纹不增加轮次，失败重试不增加轮次。
+
+不要沿用旧“四步修复”：不删 PACS、不删 state、不提升全局 UID 版本号。
+详细触发条件、恢复策略和验收证据见 [补测轮次与升级说明](rec-rounds.md)。
+
+升级操作：
+
+1. systemctl stop iol2dcm，备份 /var/lib/iol2dcm/state.json 及存在的
+   state.json.spool，确认目录可写、有磁盘空间。
+2. 更新代码至 v1.3.4；保留现场 config.yaml 和全部 state，无新配置项。
+3. systemctl start iol2dcm，观察 Rec 2 ... 实例齐全 和失败告警。
+4. 可运行只读 audit 检查台账；它不读 PACS，不能证明 PACS 文件实际存在。
+   现场在 PACS 查看相同 study 中的新轮次及 OAM/KER 数值，完成最终验收。
+
+watch / run 对同一路径 state 加进程锁。运行服务期间的手动 run 会拒绝
+并行写入；只读 audit 不受影响。不要使用另一份 state 指向同一个设备/PACS。
+run 有未完成、暂停或 stale 时返回 1；配置、state 损坏、持久化失败返回 2。
+目标不可达返回 3。watch 遇到 state 写盘失败会退出，交给服务管理器告警/重启；
+恢复存储后以原 UID 重试。
+
+限制：C-STORE 逐实例发送，不是原子 study 事务。网络中断期间 PACS 可以暂时
+只显示某轮的一部分；该轮不会记 done，恢复后补齐。无 REST/查询模式不能发现
+PACS 被外部删改、备份回滚或服务端错误返回成功；必须保全 state 与 PACS 的
+备份一致性。查看者应采用最高完整轮次；Rec N 是版本标识，不是诊断结论。
+
+### 旧版补测 stale 自动迁移
+
+**触发条件**：保留原配置、常数及 state 升级启动后，watch 首次启动扫描
+MDB，无需等待文件再次变化。原 guid|exam_date 可读、有有效变化测量、
+PatientID/日期/study 归属一致时自动排队。普通旧 stale 缺 from 也接受；
+done 缺 revision 按 1，继承 uid_seed（缺失按空串），在原 study 生成 Rec 2。
+实例数相同也按内容指纹判定。其他未变 done 不重推。--since 不应排除待迁移
+记录；--limit/时间预算仅延迟，watch 后续继续。
+
+**成功判据**：完整生成该轮全部 DICOM，校验哈希、患者/study、SOP/Series
+唯一性后发送。SC/OAM/KER 名称均加 Rec N，Series/SOP UID 区别于历史轮次。
+只有全部预期 SOP 明确返回 C-STORE 0x0000，才原子提交 done 的最新指纹、
+revision、实例数、study_uid 与载荷证据，并清除该例 stale/pending/failed。
+完成日志包含“实例齐全，done 已持久化”。旧轮次保留，done 的案例数不增加。
+
+自动判据是 C-STORE 接收确认加持久化账本。audit 不读取 PACS，不能证明
+远端逐字节保存；部署验证可在 PACS 查看器检查同 study 的新轮次与测量值，
+这不构成自动迁移的人工前置条件。
+
+**失败状态**：生成不齐不发送；部分接收、断网或响应丢失保留旧 done、stale
+及冻结 pending，failed 记录错误、接收 UID 和 next。watch 自动退避重放同轮
+载荷，失败重试不递增轮次。日志 ERROR“Rec N 未完成 X/Y”，audit/run 非零。
+PACS 全收但 done 写盘失败时，不输出已提交成功；进程退出 2，重启复用原轮。
+坏载荷、Warning、身份/study 冲突、目标切换或无法重构的旧部分接收暂停告警，
+修复根因或恢复一致备份，不通过删 state/PACS 清警。
+
+**运维操作**：不提升全局 UID 版本、不删 done/stale、不删 PACS 旧实例。
+audit 只读，watch/run 执行迁移；查看完成日志与台账，失败时保全 state/spool。
+没有新增配置项、REST 凭据或自动删除 PACS 的路径。
+
+**回滚**：不能直接启动不理解轮次的旧版本，也不能只恢复升级前 state。
+代码、配置、state、spool 与 PACS 的恢复必须保持一致，避免复用已存在的 UID。
 
 ## 常见故障
 
@@ -461,24 +604,22 @@ systemctl restart iol2dcm
 | 日志「… 仍在守候」 | 按 `watchdog.log_every` 节流的进度行（默认每 20 次 ≈ 5 分钟一行） |
 | 日志「本轮未消费（pacs）」 | 守候通过但预检又失败（探测与推送之间掉了）。签名未推进，下轮重来 |
 | 日志「第 N 次失败，Xs 后重试」 | 单例退避中，见 `retry` 段；不到点不会重新渲染那一例 |
-| 日志「failed 队列清理 N 条」 | 那些检查已被设备归档、库里读不到，无从重试 |
+| 日志「failed 队列清理 N 条」 | 仅清理无接收历史/无 pending 的归档失败；有载荷继续补齐，stale/接收历史保留告警 |
 | 日志「度数不可算（缺 AL 或缺 K），跳过晶体单」 | **正常**：只发 OAM/KER 结构化实例，PACS 里看得到测量值但没有晶体单 |
 | 日志「实例不齐 X/Y（生成阶段失败）」 | 渲染或封装抛异常了。按退避重试，不会误标完成 |
 | PACS 里只有 OAM 没有晶体单 | 这条检查没测角膜曲率（或没测眼轴），算不出度数。见 `state.json` 的 `sc: 0` |
 | 日志「常数表不存在」 | 常数表被删了：`$P pipeline.py constants` 或重跑 install.sh |
 | 「待处理 0 例」但确实有新数据 | MDB mtime 没变？或该检查在 state 的 `done` 里且指纹一致 |
 | 「N 例冷却中」 | **正常**：还没满 `cooling_seconds`，到点自动推 |
-| 「N 例数据已更新待确认」 | 设备补测过，PACS 里是旧版。跑 `pipeline.py audit` 看清单，按「定点修复」处理 |
+| 「N 例数据已更新待确认」 | 普通有效补测自动新增 Rec N；空测量、身份冲突、旧部分接收等暂停告警。只读 audit 看原因，禁止删 state 强推 |
 | 中文变问号 | 缺中文字体，`apt install fonts-noto-cjk` |
 | 部分实例推送失败 | 看 `state.json` 的 `failed` 字段，有具体 SOP UID 与错误码 |
 
 ## 全量回填
 
-首次部署时 state 为空，会自动把所有历史数据推一遍：
-
-```
-全库病例 × 约 1.15 s ≈ 数小时
-```
+首次部署时 state 为空，会自动把所有历史数据推一遍。耗时取决于病例数、
+每例晶体款数、并发进程和 PACS 响应速度。应先用合成或脱敏数据测量吞吐量，再评估全量任务耗时。
+选择并发数与查看实测条件见[架构说明](architecture.md#并发处理)。
 
 `watch` 模式每轮有 `--max-seconds 300`（5 分钟）预算，到点就回到循环开头
 重新检查 mtime。配合「按日期倒序」排序，保证新拍的片子不会排在几千例积压后面。
@@ -493,15 +634,21 @@ nohup /opt/iol2dcm/venv/bin/python /opt/iol2dcm/pipeline.py run \
 
 ## 备份
 
-要备份的只有三样：
+停止服务后一起备份，state 与 spool 必须是同一时点：
 
 ```
 /opt/iol2dcm/config.yaml            型号清单与口径
 /opt/iol2dcm/iolcon_constants.json  常数表（可重建，但重建要联网）
-/var/lib/iol2dcm/state.json         进度（丢了就重推，不致命）
+/var/lib/iol2dcm/state.json         轮次账本与未完成事务，不可丢弃
+/var/lib/iol2dcm/state.json.spool/  未完成轮次的不可变 DICOM，存在时必须保全
 ```
 
 代码可以用 `install.sh` 重装，不需要备份。重装不会碰 `config.yaml`。
 
 `/etc/systemd/system/iol2dcm.service` 和 `/etc/logrotate.d/iol2dcm` 是生成的，
 不要手改 —— 下次重装会被覆盖。要改服务参数改 `install.sh` 里的 `UNIT_LINES`。
+
+spool 含患者信息，目录 0700、文件 0600，按 state 同等级保护、加密备份。
+完成轮次在 done 持久化后才清本地载荷；空 spool 目录是 state 丢失保护标记，勿删。
+state 与 spool 同时丢失或回退时，C-STORE 无法重建历史轮次；不能以空 state
+重启已有 PACS 的生产任务。

@@ -1,5 +1,20 @@
 # 常数表
 
+常数表回答的问题是：**配置的某款人工晶状体，在四个公式里分别使用什么参数？**
+程序从 IOLCon 导出文件生成本机 JSON，再按 `config.yaml` 的 `lenses` 清单取用。
+常数表不是患者测量数据，也不会自动决定该植入哪款晶体。
+
+最常见的操作：
+
+~~~bash
+cd /opt/iol2dcm
+./venv/bin/python pipeline.py constants --show ZCB00 --local  # 只查本地，不联网
+./venv/bin/python pipeline.py lenses                          # 核对当前配置
+~~~
+
+需要新增或更换型号时，先查准 `key`，再修改配置并重启服务。详见
+[换晶体型号](#换晶体型号)。
+
 ## 公式名口径
 
 一律按 IOLCon 写法，全链路统一（报告单、XML、state、日志）：
@@ -19,8 +34,9 @@
 https://iolcon.org/downloadLenses.php?action=download
 ```
 
-约 1 MB / 646 款 / 下载约 100 秒。**不要抓网页**——项目早期抓 `printLenses.php`
-解析 HTML，页面改版就崩，而且慢。
+XML 未压缩约 1 MB；一次历史抓取得到 646 款，实际数量与下载时间以上游为准。
+**不要抓网页**——项目早期抓 `printLenses.php` 解析 HTML，页面改版就崩，而且慢。
+当前实现使用 gzip，速度对比见[下载速度](#下载速度必须走-gzip)。
 
 ```bash
 python3 pipeline.py constants                  # 联网抓取并重建
@@ -36,7 +52,15 @@ python3 pipeline.py constants --show "Nidek SZ-1"  # 只看某款
 optimized  >  ULIB  >  nominal
 ```
 
-**逐字段合并，不是整块二选一。** 有些晶体 optimized 只给了部分公式，ULIB 反而给了完整四个；整块选择会丢掉能拿到的值。
+三个来源可以简单理解为：
+
+| 来源 | 含义 |
+|---|---|
+| `optimized` | IOLCon 条目中提供的优化常数 |
+| `ulib` | IOLCon 的 ULIB 来源常数 |
+| `nominal` | 厂商名义常数 |
+
+**逐字段合并，不是整块二选一。** 有些晶体 optimized 只给了部分公式，ULIB 反而给了完整四个；整块选择会丢掉能拿到的值。这个顺序只是项目的数据选取规则，不代表对具体患者或晶体的临床推荐。
 
 生成的 JSON 里每款都记录 `sources`，逐公式标明取自哪个来源：
 
@@ -218,11 +242,12 @@ sig = "|".join(L["key"] for L in lenses)
 ```bash
 systemctl stop iol2dcm
 mv /var/lib/iol2dcm/state.json /var/lib/iol2dcm/state.json.old
-systemctl start iol2dcm            # 空 state → 全量重推，15000 例约 4.8 小时
+systemctl start iol2dcm            # 空 state → 全量重推；耗时取决于数据量与现场性能
 ```
 
-注意 PACS 对同 SOP UID 会静默去重，内容改版还要提升
-`dicomlib/dicom.py` 里的 `PRIVATE_CREATOR` 版本号。
+> 不要只删 state 就直接全量重推。PACS 可能对相同 SOP Instance UID 静默去重，
+> 返回成功却保留旧内容；擅自改版本号也可能产生重复 series。重算历史病例前，
+> 必须先制定旧实例清理与结果核对方案，见 [定点修复单个病例](operations.md#定点修复单个病例推荐)。
 
 ## 合规
 

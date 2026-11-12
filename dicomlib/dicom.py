@@ -21,10 +21,10 @@ Ophthalmic Axial Measurements Storage（见 oam.py）。
 * PixelData 必须是 JPEG 封装，不能塞 PNG 字节；否则 Orthanc 照收 200 但
   /preview 返 415、取回解码报 "number of bytes of pixel data is less"。
 * SpecificCharacterSet 必须 ISO_IR 192，否则中文姓名落库成 "?"。
-* 确定性 UID（sha256 派生）重复推幂等；但**改版重推会被静默去重**，
-  改版时先删旧实例。
+* 确定性 UID（sha256 派生）重复推幂等；补测由 core.revisions 为 Rec N
+  派生新的 Series/SOP UID，原 study 保持不变、历史轮次保留。
 * PatientID 绝不可为空（空 ID = 所有患者并成一个）。
-* 写入只走 4242 标准 C-STORE；REST(8042) 仅用于只读核对。
+* 写入只走标准 C-STORE；管线不调用 REST，也不删除 PACS 数据。
 """
 from __future__ import annotations
 
@@ -93,8 +93,24 @@ def _common(ds, rec, cfg, study_uid, series_uid, sop_uid, sop_class,
     return ds
 
 
-def study_uid_for(patient_id, exam_date):
-    """同一患者多次检查落同一 study；不同患者绝不撞 UID。"""
+def study_uid_for(patient_id, exam_date, case=""):
+    """同一患者多次检查落同一 study；不同患者绝不撞 UID。
+
+    case
+    ----
+    「一行一个案例」之后，同一患者同一天可能有两轮独立测量。若两轮都用
+    同一个 study_uid，SC/OAM/KER 的 SOP UID 也会完全相同（它们的种子里
+    没有 guid），第二轮推上去会被 PACS 静默去重 —— 看起来成功，实际什么
+    都没进库。
+
+    所以第二轮起要换一个 study。case 就是那个区分因子（传该行的 guid）。
+
+    ★ 默认 "" 时**完全等于旧公式**，一个字节都不差 —— 这是迁移的兼容锚点：
+      已推过的病例 uid_seed=""，UID 与当年推的一致，重算也不会变，零重推。
+      只有新案例才传 guid，拿到一个全新的 study。
+    """
+    if case:
+        return uid("iol2dcm-study", patient_id, exam_date, case)
     return uid("iol2dcm-study", patient_id, exam_date)
 
 
@@ -102,7 +118,8 @@ def series_uid_for(study_uid, lens_name):
     return uid("iol2dcm-series", study_uid, PRIVATE_CREATOR, lens_name)
 
 
-def build_sc(rec, image, cfg, patient_id, lens, series_num=1, instance_num=1):
+def build_sc(rec, image, cfg, patient_id, lens, series_num=1, instance_num=1,
+             study_uid=None):
     """晶体单图片 → Secondary Capture 实例。
 
     image  可以是 **PIL Image**（推荐，见 report.render_image），
@@ -113,7 +130,10 @@ def build_sc(rec, image, cfg, patient_id, lens, series_num=1, instance_num=1):
     from pydicom.encaps import encapsulate
     from PIL import Image
 
-    study_uid = study_uid_for(patient_id, rec.get("date"))
+    # ★ study_uid 可以由调用方给（「一行一个案例」要按 uid_seed 派生）。
+    #   不给时保持旧行为，向后兼容。
+    if study_uid is None:
+        study_uid = study_uid_for(patient_id, rec.get("date"))
     series_uid = series_uid_for(study_uid, lens["name"])
     sop_uid = uid("iol2dcm-sc", study_uid, lens["name"], PRIVATE_CREATOR)
 
@@ -285,8 +305,16 @@ def push_cstore(datasets, host, port, aet, timeout=60, prefer_jpeg=True):
             if ts_now not in req_tss:
                 req_tss = [ts_now] + req_tss
             ae = AE(ae_title="IOL2DCM")
+            ae.connection_timeout = timeout
+            ae.acse_timeout = timeout
+            ae.network_timeout = timeout
+            ae.dimse_timeout = timeout
             ae.add_requested_context(send.SOPClassUID, req_tss)
-            assoc = ae.associate(host, port, ae_title=aet)
+            try:
+                assoc = ae.associate(host, port, ae_title=aet)
+            except Exception as e:
+                msg = f"association error: {e}"
+                continue
             if not assoc.is_established:
                 # 这一次确实没发出去（但之前的尝试可能已经发出去了，
                 # 所以不能重置 unknown）
@@ -319,8 +347,18 @@ def push_cstore(datasets, host, port, aet, timeout=60, prefer_jpeg=True):
                 # 传输语法没被接受 → 这一次确实没发出去
                 msg = f"context rejected: {e}"
                 ok = False
+            except Exception as e:
+                # Return all preceding acknowledgements, especially Warning:
+                # a later network error must not erase coercion evidence.
+                msg = f"send error: {e}"
+                ok = False
+                unknown = True
             finally:
-                assoc.release()
+                try:
+                    assoc.release()
+                except Exception:
+                    # A received response remains evidence even if release fails.
+                    pass
             if ok:
                 break
         results.append((ds.SOPInstanceUID, ok, msg, not unknown))

@@ -68,11 +68,11 @@ import render.report as report
 import render.sheet as sheet
 import sources.constants as constants
 import sources.mdb as mdb
-from core import config, patient
+from core import config, patient, revisions
 from core.config import build as build_config
 from core.utils import FORMULA_ORDER, digest, log, log_label
 
-__version__ = "1.3.1"
+__version__ = "1.3.4"
 
 # 一次检查生成哪些实例。改动实例结构时必须提升这个串 ——
 # state 的签名含它，否则老病例不会被重推，新加的那路 series 永远补不上。
@@ -81,9 +81,11 @@ __version__ = "1.3.1"
 #   1.2.0  推送目标不可达时原地守候，单例失败退避
 #   1.3.0  缺 AL 或缺 K 时不出晶体单，只发 OAM/KER；不再因缺一项丢整眼
 INSTANCE_LAYOUT = "sc,oam+acd,ker;partial-eyes"
-# ★ 1.3.1 没有改实例结构（仍是 SC×N + OAM + KER），所以这个串**不动**：
-#   动它会让 state 整体作废、全量重推。本版新增的是「按内容
-#   指纹判重」和「冷却期」，属于调度策略，不影响已推实例的内容。
+# ★ 1.3.1 / 1.3.2 / 1.3.3 都没有改实例结构（仍是 SC×N + OAM + KER），
+#   所以这个串**不动**：修改前必须设计历史状态迁移，不能使旧记录整体失效。
+#   1.3.1 内容指纹 + 冷却期；1.3.2 选行口径；1.3.3 一行一个案例（幂等键
+#   换成 guid|exam_date）—— 都属于调度与键空间，不影响已推实例的内容。
+#   1.3.3 的键迁移靠 state 自己的 KEY_SCHEME 标记做一次，不靠这个签名。
 
 # ⚠️ 适用范围：仅对 Carl Zeiss IOLMaster 500 测试过。详见 DISCLAIMER.md
 SUPPORTED_DEVICE = "Carl Zeiss IOLMaster 500"
@@ -119,6 +121,109 @@ def _workers(cfg, args):
     return w
 
 
+# ──────────────────────────────────────────────────────────────────
+# 幂等键：一行一个案例
+
+# 旧版键 = "姓|名|exam_date"（一次就诊），同一天测两轮只能留一行。
+# v1.3.3 起改成 "guid|exam_date"（一行），同一天两轮各自成案例。
+#
+# guid 可以对应多个 exam_date；姓名与生日不能唯一标识检查行。
+# 使用 guid|exam_date 区分案例，避免独立记录互相覆盖。
+#
+# ★ KEY_SCHEME 写进 state：迁移只做一次，之后每轮跳过。
+#   老 state 没有这个字段 → 触发迁移；有 → 直接跳过。
+KEY_SCHEME = "row-v1"
+
+
+def _row_key(row, fam="", giv=""):
+    """一行的幂等键：guid|exam_date。
+
+    guid 缺失时退回旧键（姓|名|日期）并报警 —— 宁可可能撞键，
+    也不能因为 guid 字段异常就把这一行静默丢掉。
+    """
+    guid = str(row.get("guid") or "").strip()
+    date = str(row.get("exam_date") or "")[:8]
+    if guid:
+        return f"{guid}|{date}"
+    log(f"WARN 该行 guid 为空，退回旧键 {fam}{giv} {date}"
+        f"（可能与同日其他行撞键）")
+    return f"{fam}|{giv}|{date}"
+
+
+def _migrate_keys(state, groups):
+    """旧键 → 新键。幂等；只在首次进行。
+
+    返回统计 dict，供日志/audit 展示。
+
+    ★ 铁律：**已推过的内容绝不重推**。所以
+      · 单行组：那一行直接继承原记录，uid_seed="" 使 UID 与当年一致
+      · 多行组：用 pick_row(already_pushed=True) 找出「PACS 里那份来自
+        哪一行」，该行继承；其余行不建记录，作为新案例走正常流程
+      · 找不到对应 MDB 组的（孤儿）**保留不动**并计数上报，不删任何记录
+    """
+    if state.get("key_scheme") == KEY_SCHEME:
+        return {"migrated": False}
+
+    done = state.get("done") or {}
+    if not done:
+        state["key_scheme"] = KEY_SCHEME
+        return {"migrated": True, "renamed": 0, "sorted": 0,
+                "split_groups": 0, "new_cases": 0, "orphan": 0,
+                "conflict": 0}
+
+    # ---- 1) 算出旧键 → 新键 ----
+    mapping = {}          # old_key -> (new_key, 组内行数)
+    orphan, split_groups, new_cases, conflict = 0, 0, 0, 0
+    for old in list(done):
+        parts = old.split("|")
+        if len(parts) != 3:
+            continue          # 不是旧键，原样留着
+        fam, giv, date = parts
+        rows = groups.get((fam, giv, date))
+        if not rows:
+            orphan += 1
+            continue          # 孤儿：保留原键，由人决定
+        src, _ = mdb.pick_row(rows, already_pushed=True)
+        nk = _row_key(src, fam, giv)
+        mapping[old] = (nk, len(rows))
+        if len(rows) > 1:
+            split_groups += 1
+            new_cases += len(rows) - 1
+
+    # ---- 2) 搬四个字典 ----
+    books = ("done", "failed", "cooling", "stale")
+    renamed = 0
+    for old, (nk, _n) in mapping.items():
+        if nk == old:
+            continue
+        for b in books:
+            book = state.get(b) or {}
+            if old not in book:
+                continue
+            if nk in book:
+                # 极少数：两行 guid 相同（同 guid 同日期）。保留先到的。
+                conflict += 1
+                continue
+            book[nk] = book.pop(old)
+            renamed += 1
+
+    # ---- 3) 给所有 done 补 uid_seed ----
+    # "" = 用旧 study 种子（与当年推的一致）→ 零重推
+    # 非空 = 该行 guid，拿一个全新 study（新案例）
+    for rec in (state.get("done") or {}).values():
+        if isinstance(rec, dict) and "uid_seed" not in rec:
+            rec["uid_seed"] = ""
+
+    state["key_scheme"] = KEY_SCHEME
+    return {"migrated": True, "renamed": renamed, "sorted": 0,
+            "split_groups": split_groups, "new_cases": new_cases,
+            "orphan": orphan, "conflict": conflict}
+
+
+class StatePersistenceError(RuntimeError):
+    """State durability is required before every network side effect."""
+
+
 def _save_state(path, state):
     """原子写：先写 .tmp 再 rename，防中途断电写出半个 JSON。"""
     try:
@@ -133,8 +238,10 @@ def _save_state(path, state):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        revisions._sync_dir(d)
     except Exception as e:
-        log(f"WARN 状态落盘失败: {e}")
+        log(f"ERROR 状态落盘失败，停止发送: {e}")
+        raise StatePersistenceError(str(e)) from e
 
 
 def _record(row, name):
@@ -145,6 +252,7 @@ def _record(row, name):
     """
     rec = {
         "name": name,
+        "guid": row.get("guid") or "",
         "dob": row.get("dob") or "",
         "date": row.get("exam_date") or "",
         "sex": patient.norm_sex(row.get("sex")),
@@ -225,6 +333,41 @@ def _cooling_seconds(cfg):
     return max(0.0, v)
 
 
+# 采集日期与 exam_date 的差值只用于**展示**（audit 里让人看见「这一例的
+# 测量是几天前采的」），**不再作为出单闸门**。
+#
+# ★ v1.3.3 起删掉了 max_stale_days。理由见 _exam_gap_days 的说明。
+
+def _exam_gap_days(row):
+    """guid 采集日期与 exam_date 相差多少天（exam - measure，带符号）。
+
+    ★ 只用于**展示**，不是闸门。v1.3.3「一行一个案例」之后：
+      这一行就是它自己那次检查，exam_date 是它的检查日期，guid 里是设备
+      记录的原始采集时刻。两者不同是设备的业务行为（把一次测量挂到某个
+      就诊日期下），不是管线要纠正的错误 —— 使用者口径是「一行算一次
+      有效结果」「跨天就是测了两次」，所以管线照常按「信息是否充足」处理。
+
+    以前这里驱动 max_stale_days 闸门，跨天的进 stale 等人工；那在旧模型
+    （组内选一行，可能拿旧数据冒充这次检查）下有意义，新模型下没有防守
+    对象，因此已移除。
+
+    None 表示无法判定（guid 解析不出或日期非法）。
+    """
+    # ★ 优先用取数层算好的字段；外部脚本 monkey-patch
+    #   load_measurements 返回的行可能没有它，这时从 guid 现算 —— 与
+    #   mdb.row_is_on_exam_date 同源，避免两处判出不同结果。
+    d = str(row.get("measure_date") or mdb.measure_date(row.get("guid")))
+    e = str(row.get("exam_date") or "")[:8]
+    if len(d) != 8 or len(e) != 8:
+        return None
+    try:
+        a = datetime.strptime(d, "%Y%m%d")
+        b = datetime.strptime(e, "%Y%m%d")
+    except ValueError:
+        return None
+    return (b - a).days
+
+
 def _fingerprint(rec):
     """一条检查「原始测量值」的内容指纹（16 位十六进制）。
 
@@ -238,7 +381,7 @@ def _fingerprint(rec):
         · 补测过 → 指纹变了 → 能立刻认出来
 
     ★ 为什么不含计算结果/型号/常数
-      那些变了由 state 的 sig 负责（_load_state 整体重置）。指纹要回答
+      那些变了由 state 的 sig 负责（签名变化安全停止）。指纹要回答
       的是「设备那边的实测数据变了没有」，混进派生量会让「换型号」和
       「补测」混为一谈。
 
@@ -291,19 +434,39 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
     日志先在子进程里攒成行，回主进程按顺序打 —— 避免多进程交错。
 
     返回 (key, ok, info, errs, lines)：
-        ok=True  -> info 是要写进 state["done"] 的 dict
+        ok=True  -> prepared 只表示载荷完整；父进程确认发送并持久化后才 done
         ok=False -> info 是要写进 state["failed"] 的 dict
     """
-    date, key, rec, fp = task
+    date, key, rec, fp, uid_seed = task
+    revision = int(rec.get("_revision", 1))
+    spool = rec.get("_spool")
+    render_config = rec.get("_render")
+    if render_config:
+        cfg, lenses, meta = (render_config[k] for k in ("cfg", "lenses", "meta"))
+    if spool and rec.get("_ready") and not os.path.exists(spool):
+        return key, False, {"fp": fp, "err": "已发布载荷丢失，停止该轮；禁止重新生成",
+                            "permanent": True, "perm_fp": fp}, [], []
+    if spool and os.path.exists(spool):
+        try:
+            datasets, info = revisions.read_payload(spool)
+            revisions.validate_journal(info, rec, fp, uid_seed)
+            return key, True, {**info, "prepared": True}, [], []
+        except Exception as e:
+            return key, False, {"fp": fp, "err": f"持久化载荷损坏，停止该轮: {e}",
+                                "permanent": True, "perm_fp": fp}, [], []
     target, step = meta["target_refraction"], meta["step"]
     name = rec["name"]
+    # ★ 这 15 条 lines 最终在 commit() 里逐行 log() -> /var/log/iol2dcm.log。
+    #   所以它们和 run_once 的日志一样，必须用稳定标签而不是明文姓名。
+    #   name 本身仍要保留：_fingerprint / make_pid / state 的 key 都依赖它。
+    log_name = log_label(name)
     lines = []
 
     # ★ PatientID 纯本地确定性生成：同样的姓名+生日永远得到同样的 ID，
     #   重复推送幂等，不需要查任何 PACS 接口。
     pid = patient.make_pid(rec["dob"], name)
     if not pid:
-        lines.append(f"SKIP(无生日，无法生成 PatientID) {name} {date}")
+        lines.append(f"SKIP(无生日，无法生成 PatientID) {log_name} {date}")
         # permanent：库里就没生日，重试一万次也不会有
         # ★ 所有失败返回都要带 fp：commit() 靠它判断「这次失败是不是同一版
         #   内容」，同内容才合并接收历史。少了 fp，一次生成失败就会把
@@ -321,9 +484,9 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
     try:
         calc.calc_record(rec, lenses, target=target, step=step)
     except Exception as e:
-        lines.append(f"✗ 计算失败 {name} {date}: {e}")
+        lines.append(f"✗ 计算失败 {log_name} {date}: {e}")
         # permanent：计算失败是确定性的（常数表/型号/配置问题），
-        # 重试只会每轮刷同一条日志。改配置或型号后 state 签名变化会重置。
+        # 重试只会每轮刷同一条日志。保留 pending，排查原因后恢复同一轮。
         return key, False, {"t": _now(), "date": date,
                             "fp": fp, "perm_fp": fp,
                             "err": f"计算失败: {e}"[:200],
@@ -353,9 +516,12 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
     n_oam = n_ker = 0            # 实例数（0/1）
     oam_eyes = ker_eyes = 0      # 实例里实际写了几只眼
     if not can_calc:
-        lines.append(f"  · {name} {date} 度数不可算（缺 AL 或缺 K），"
+        lines.append(f"  · {log_name} {date} 度数不可算（缺 AL 或缺 K），"
                      f"跳过晶体单，只发结构化实例")
 
+    # ★ study UID 只算一次，SC / OAM / KER 共用 —— 三者必须在同一个 study 下。
+    #   uid_seed 由调用方按「已推继承 / 新案例用 guid」决定，见 run_once。
+    study_uid = dicom.study_uid_for(pid, rec.get("date"), uid_seed)
     n_sc = 0
     for si, L in enumerate(lenses, start=1):
         if not can_calc:
@@ -367,11 +533,12 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
             img = report.render_image(struct, axes=_axes(rec),
                                       institution=_institution(cfg))
             datasets.append(dicom.build_sc(rec, img, cfg, pid, L,
-                                           series_num=si, instance_num=1))
+                                           series_num=si, instance_num=1,
+                                           study_uid=study_uid))
             n_sc += 1
         except Exception as e:
             errs.append(f"{L['name']}: {e}")
-            lines.append(f"  ✗ {name} {date} {L['name']} 生成失败: {e}")
+            lines.append(f"  ✗ {log_name} {date} {L['name']} 生成失败: {e}")
 
     # ★ series 号从「晶体单实际生成了几张」往下排，不能写死 len(lenses)+1：
     #   不出晶体单时那几号是空的，PACS 里会看到跳号的 series。
@@ -383,7 +550,6 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
     # 是 Type 1），该眼整体不写；两眼都没有 AL 则整实例不发。
     if has_al_eye:
         try:
-            study_uid = dicom.study_uid_for(pid, rec.get("date"))
             ds_oam = oam.build(
                 rec, cfg, pid, study_uid,
                 oam.series_uid_for(study_uid),
@@ -398,14 +564,13 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
                 next_series += 1
         except Exception as e:
             errs.append(f"OAM: {e}")
-            lines.append(f"  ✗ {name} {date} OAM 生成失败: {e}")
+            lines.append(f"  ✗ {log_name} {date} OAM 生成失败: {e}")
 
     # Keratometry Measurements Storage：K1/K2、曲率半径 r1/r2、散光轴位。
     # 这三项在 OAM IOD 里没有位置（K 有独立的 78.3 SOP Class），
     # 所以单独一个 series。缺 r 的眼不进序列，两眼都缺则不生成。
     if has_k_eye:
         try:
-            study_uid = dicom.study_uid_for(pid, rec.get("date"))
             ker = keratometry.build(
                 rec, cfg, pid, study_uid,
                 keratometry.series_uid_for(study_uid),
@@ -421,10 +586,10 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
                 next_series += 1
         except Exception as e:
             errs.append(f"KER: {e}")
-            lines.append(f"  ✗ {name} {date} 角膜曲率生成失败: {e}")
+            lines.append(f"  ✗ {log_name} {date} 角膜曲率生成失败: {e}")
 
     if dry_run:
-        lines.append(f"DRY {name} {date} pid={pid} "
+        lines.append(f"DRY {log_name} {date} pid={pid} "
                      f"{len(datasets)}/{expected} 实例就绪")
         return key, True, {"dry": True, "pid": pid, "n": len(datasets)}, errs, lines
 
@@ -433,7 +598,7 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
         #   · 本该有实例却一个都没生成（渲染/封装全炸）→ 失败，按退避重试
         #   · 确实没有任何可录入的测量值（两眼既无 AL 也无 r）→ 跳过
         if can_calc or calc.has_measurement(rec):
-            lines.append(f"✗ {name} {date} 实例全部生成失败")
+            lines.append(f"✗ {log_name} {date} 实例全部生成失败")
             # ★ 必须带 fp：commit() 靠它判断「这次失败是不是同一版内容」，
             #   同内容才把之前的 sent_uids/maybe_uids 合并过来。少了 fp，
             #   一次生成失败就会把「旧内容已在 PACS 里」这段历史冲掉，
@@ -442,94 +607,111 @@ def _process_one(task, cfg, lenses, meta, push_target, dry_run):
                     {"t": _now(), "date": date, "fp": fp,
                      "err": ("实例全部生成失败: "
                              + "; ".join(errs))[:200]}, errs, lines)
-        lines.append(f"SKIP(无可录入的测量值) {name} {date}")
+        lines.append(f"SKIP(无可录入的测量值) {log_name} {date}")
         return key, True, {"t": _now(), "pid": pid, "date": date,
                            "src": "empty", "n": 0}, errs, lines
 
-    # 一次 C-STORE 推完整 study（同关联，省握手）
-    sent = 0
-    sent_uids = []           # 已被 PACS **确认接收**的 SOP Instance UID
-    maybe_uids = []          # 可能已接收（响应丢失，无法确定）
-    uncertain = False        # 有任何实例的结果不确定
-    try:
-        res = dicom.push_cstore(datasets, push_target["host"],
-                                push_target["port"], push_target["aet"],
-                                timeout=120, prefer_jpeg=True)
-        for sop, good, msg, known in res:
-            uid = str(sop)
-            if good:
-                sent += 1
-                sent_uids.append(uid)
-            elif not known:
-                # ★ 空响应/无应答：PACS 很可能已经存下了这个实例。
-                #   绝不能当成「明确没收到」—— 否则内容变更后会普通重试，
-                #   同 UID 被静默去重，账目记成新版成功、PACS 还是旧内容。
-                uncertain = True
-                maybe_uids.append(uid)
-                errs.append(f"{uid[-12:]} {msg}(结果未知)")
-                lines.append(f"  ? {name} {date} 实例结果未知 {msg}")
-            else:
-                errs.append(f"{uid[-12:]} {msg}")
-                lines.append(f"  ✗ {name} {date} 实例推送失败 {msg}")
-    except Exception as e:
-        # 异常时整批都可能已经到达对方，无法区分
-        uncertain = True
-        maybe_uids.extend(str(ds.SOPInstanceUID) for ds in datasets)
-        errs.append(f"推送异常: {e}")
-        lines.append(f"  ✗ {name} {date} 推送异常: {e}")
-
-    # ★ 部分成功 / 异常：把「这次发的是哪一版内容」记进 failed。
-    #   否则设备在退避期间补测后，下次重试会带着**新内容**、用**同一批
-    #   SOP UID** 再推一遍 —— PACS 保留首个（旧内容）并返回成功，于是
-    #   state 记「6 实例齐全 + 新指纹」，PACS 里还是旧数据，而且 done.fp
-    #   已经是新的，连 audit 都失去发现依据。这与本次事故是同一个坑，
-    #   只是入口从 done 换成了 failed。
-    # ★ sent_uids + maybe_uids 一起表示「这一版内容可能已经有一部分在
-    #   PACS 里了」。只要非空，内容一变就不能普通重试（同 SOP UID 会被
-    #   静默去重，导致账目与 PACS 不一致）。
-    partial = {"t": _now(), "date": date, "fp": fp,
-               "sent_uids": sent_uids, "maybe_uids": maybe_uids,
-               "sent": sent, "expect": expect,
-               "uncertain": uncertain}
-
-    if sent == expected and expect == expected:
-        # state 里记**实际**发了什么：缺 AL 或缺 K 的病例没出晶体单，
-        # 只写 lenses 会让人以为出过单。
-        # ★ fp 记的是**这一版内容**的指纹，与 done 一起落盘。
-        #   下一轮扫到同一 key 时比对：一样就跳过，不一样说明设备补测过。
+    if spool:
+        if len(datasets) != expected or errs:
+            return key, False, {"fp": fp, "err": "生成不齐，未发送: " + "; ".join(errs)}, errs, lines
+        revisions.apply_round(datasets, revision)
         info = {"t": _now(), "pid": pid, "src": "generated", "date": date,
-                "sc": n_sc,
-                "lenses": [L["name"] for L in lenses][:n_sc],
+                "label": log_name,
+                "guid": rec.get("guid") or "", "uid_seed": uid_seed,
+                "study_uid": study_uid, "revision": revision,
+                "sc": n_sc, "lenses": [L["name"] for L in lenses][:n_sc],
                 "oam_eyes": oam_eyes, "ker_eyes": ker_eyes,
                 "instances": expected, "fp": fp}
-        detail = [f"SC×{n_sc}"] if n_sc else []
-        if n_oam:
-            detail.append(f"OAM({oam_eyes}眼)")
-        if n_ker:
-            detail.append(f"KER({ker_eyes}眼)")
-        lines.append(f"OK {name} {date} pid={pid} {expected} 实例齐全"
-                     f"（{' + '.join(detail)}）")
-        return key, True, info, errs, lines
+        try:
+            datasets, info = revisions.publish_payload(spool, datasets, info)
+        except Exception as e:
+            return key, False, {"fp": fp, "err": f"载荷落盘失败，未发送: {e}"}, [], lines
+        return key, True, {**info, "prepared": True}, [], lines
 
-    if expect < expected:
-        # ★ 生成阶段就少了实例（渲染/封装抛异常）。这些**不能**当成
-        #   「数据本来就没有」—— 否则病例被标 done，缺的 series 永远补不上。
-        #   按退避重试，PACS 恢复/字体修好后能补齐。
-        lines.append(f"✗ {name} {date} 实例不齐 {expect}/{expected}"
-                     f"（生成阶段失败）")
-        info = dict(partial)
-        info["err"] = (f"实例不齐 {expect}/{expected}: "
-                       + "; ".join(errs)[:160])
-        return key, False, info, errs, lines
-    if sent > 0:
-        lines.append(f"⚠ {name} {date} 部分成功 {sent}/{expect}")
-        info = dict(partial)
-        info["err"] = f"部分成功 {sent}/{expect}: " + "; ".join(errs)[:160]
-        return key, False, info, errs, lines
-    lines.append(f"✗ {name} {date} 全部失败")
-    info = dict(partial)
-    info["err"] = "; ".join(errs)[:200]
-    return key, False, info, errs, lines
+    raise ValueError("非 dry-run 必须先持久化轮次；拒绝无日志发送")
+
+
+def _send_round(key, datasets, info, push_target, lines=None):
+    """Only an exact, complete set of successful SOP acknowledgements commits."""
+    lines = list(lines or [])
+    wanted = {str(ds.SOPInstanceUID) for ds in datasets}
+    sent, maybe, errs = set(), set(), []
+    coercion = False
+    try:
+        results = dicom.push_cstore(datasets, push_target["host"],
+                                   push_target["port"], push_target["aet"],
+                                   timeout=120, prefer_jpeg=True)
+        seen = set()
+        for sop, good, message, known in results:
+            sop = str(sop)
+            if sop not in wanted or sop in seen:
+                raise ValueError("C-STORE returned duplicate/unexpected SOP UID")
+            seen.add(sop)
+            # Attribute-coercion warnings are not proof of unchanged content.
+            if good and message == "0x0000":
+                sent.add(sop)
+            else:
+                if not known or good:
+                    maybe.add(sop)
+                if good:
+                    coercion = True
+                errs.append(f"{sop[-12:]} {message}")
+        if seen != wanted:
+            raise ValueError("C-STORE returned incomplete results")
+    except Exception as e:
+        maybe.update(wanted - sent)
+        errs.append(f"C-STORE 异常/结果未知: {e}")
+    revision = info["revision"]
+    label = info.get('label') or log_label(key)
+    if sent == wanted and not errs:
+        lines.append(f"C-STORE {label} {info['date']} Rec {revision} {len(wanted)} 实例明确接收，待提交台账")
+        return key, True, info, [], lines
+    lines.append(f"ERROR {label} Rec {revision} 未完成 {len(sent)}/{len(wanted)}；保留该轮载荷退避重试")
+    failure = {"t": _now(), "date": info["date"], "fp": info["fp"],
+               "revision": revision, "sent_uids": sorted(sent),
+               "maybe_uids": sorted(maybe), "sent": len(sent),
+               "expect": len(wanted), "uncertain": bool(maybe),
+               "err": "; ".join(errs)[:200]}
+    if coercion:
+        # Re-sending a coerced UID could return 0000 for the stored, altered
+        # object. Never wash that warning into a successful latest baseline.
+        failure.update(permanent=True, perm_fp=info["fp"])
+    return key, False, failure, errs, lines
+
+
+def _reserve_round(task, state, path, push_target, cfg, lenses, meta):
+    """Write-ahead allocation. Failure to fsync prevents worker dispatch."""
+    date, key, rec, fp, seed = task
+    pending = state.setdefault("pending", {})
+    existing = pending.get(key)
+    if existing:
+        if existing["target"] != push_target:
+            raise ValueError("pending round target changed; refusing to send")
+        # A prior failed fsync must never be bypassed by in-memory retry.
+        _save_state(path, state)
+        rec = copy.deepcopy(existing["rec"])
+        rec["_ready"] = bool(existing.get("ready"))
+        return date, key, rec, existing["fp"], existing["uid_seed"]
+    done = state["done"].get(key) or {}
+    failed = state["failed"].get(key) or {}
+    stale = state.get("stale", {}).get(key) or {}
+    history = bool(done or stale or failed.get("sent_uids") or
+                   failed.get("maybe_uids") or failed.get("uncertain"))
+    revision = revisions.number(done.get("revision", 1)) + 1 if history else 1
+    if done:
+        seed = str(done.get("uid_seed") or "")
+        pid = patient.make_pid(rec.get("dob"), rec["name"])
+        if done.get("pid") and pid != done["pid"]:
+            raise ValueError("PatientID changed; refusing to append to the original study")
+    rec = copy.deepcopy(rec)
+    rec["_revision"] = revision
+    rec["_spool"] = revisions.payload_path(path, key, revision)
+    rec["_render"] = copy.deepcopy({"cfg": cfg, "lenses": lenses,
+                      "meta": {k: meta[k] for k in ("target_refraction", "step")}})
+    pending[key] = {"revision": revision, "rec": rec, "fp": fp,
+                    "uid_seed": seed, "date": date, "target": dict(push_target)}
+    _save_state(path, state)
+    return date, key, rec, fp, seed
 
 
 def run_once(cfg, lenses, meta, state, args, push_target):
@@ -548,7 +730,7 @@ def run_once(cfg, lenses, meta, state, args, push_target):
         return {"ok": 0, "fail": 0, "skip": 0, "total": 0, "blocked": "schema"}
 
     # ★ 推送目标先做可达性预检：连不上就别白算一遍再逐例失败，
-    #   15000 例的活库里跑一轮要好几分钟，白算太浪费。
+    #   大型数据库里跑一轮可能需要数分钟，白算太浪费。
     #
     # ★ 但「不可达」不等于「这批数据从此不要了」：返回 blocked 让调用方
     #   知道本轮没消费 MDB 签名，下次（PACS 起来后）还会针对同一批数据
@@ -601,343 +783,358 @@ def run_once(cfg, lenses, meta, state, args, push_target):
     cooling = state.setdefault("cooling", {})
     stale = state.setdefault("stale", {})
 
+    # ★ 迁移旧键 → 新键（guid|exam_date）。幂等：只有老 state 会真做。
+    #   必须在任何 done/failed 查询之前，否则这一轮会拿旧键空跑一遍。
+    mig = _migrate_keys(state, groups)
+    if mig.get("migrated") and mig.get("renamed"):
+        log(f"↻ 幂等键迁移到「一行一案例」：改名 {mig['renamed']} 条，"
+            f"拆分 {mig['split_groups']} 组 → 新增 {mig['new_cases']} 个案例"
+            + (f"，孤儿 {mig['orphan']} 条（保留原样）" if mig.get("orphan") else "")
+            + (f"，撞键 {mig['conflict']} 条" if mig.get("conflict") else ""))
+        if not args.dry_run:
+            _save_state(args.state, state)
+
+    # ★★ 一行 = 一个案例。不再按 (姓,名,日期) 归组选行 —— 同一天测两轮
+    #   就是两个案例，各自判定、各自出单。
+    #   前提：幂等键是 guid|exam_date（见 _row_key），两轮的键天然不同。
     todo, retry_n, wait_n = [], 0, 0
     live = set()
-    cooling_n = stale_n = backfill_n = 0
+    study_owners = {}
+    for owner, entry in state["done"].items():
+        if isinstance(entry, dict) and entry.get("pid"):
+            study = dicom.study_uid_for(entry["pid"], entry.get("date"),
+                                        str(entry.get("uid_seed") or ""))
+            study_owners.setdefault(study, set()).add(owner)
+    cooling_n = stale_n = backfill_n = blocked_cases = 0
     for (fam, giv, date), rows in groups.items():
-        key = f"{fam}|{giv}|{date}"
-        live.add(key)                        # ★ 任何日期都算「库里还在」
-        if args.since and date < args.since:
-            continue
-        # ★ 同一 (姓,名,日期) 可能有多行。取**最新的一行**，不能取表里的
-        #   物理末行 —— Access 的物理顺序不等于写入顺序（改动过的行会被
-        #   挪到别处）。实测样本库里有 2 例因此取到了空行、丢掉有数据的行。
-        #   判据用 guid 内嵌的创建时刻；它缺失时退化为原来的「末行」。
-        row = mdb.pick_latest(rows)
         name = f"{fam}{giv}" if _has_cjk(fam + giv) else f"{fam} {giv}".strip()
-        rec = _record(row, name)
         log_name = log_label(name)
-        fr = state["failed"].get(key)
+        for row in rows:
+            key = _row_key(row, fam, giv)
+            if key in live:
+                log(f"ERROR {log_label(key)} 同一 guid|exam_date 出现多行，本轮拒绝发送")
+                return {"ok": 0, "fail": 0, "skip": 0, "total": 0, "blocked": "duplicate_key"}
+            live.add(key)                    # ★ 任何行都算「库里还在」
+            if args.since and date < args.since:
+                continue
+            fr = state["failed"].get(key)
+            # 该行推出去时用的 study 种子：已推记录继承它自己的（多半是 ""），
+            # 新案例用 guid —— 两者 UID 必然不同，互不覆盖。
+            uid_seed = ""
 
-        # ★★ 统一在这里清掉「从没真正推过实例」的历史 done，**必须早于
-        #    本 key 的一切指纹比较**（包括下面「无测量值」那条路径）。
-        #    这两个状态不是「PACS 里已有这个版本」：
-        #      · dry-run 记录（旧 bug 写的 {"dry": true, ...}）
-        #      · src="empty"（当时没有任何可录入的测量值，一个实例都没发）
-        #    拿它们跟当前指纹比会出两种错：
-        #      fp 相同 → 当成已完成，病例永久冻结；
-        #      fp 不同 → 当成「已推旧内容」而无谓转 stale 等人处理，
-        #                可它其实一次都没发过。
-        #    以前清理只放在「有测量值」那条路径里，于是「dry done + 当前
-        #    无测量值」会先在上面的 emptied 分支造出错误 stale 并 continue，
-        #    永远走不到清理。所以这里提前，且 d 置 None —— 只从字典 pop
-        #    而留着 d，后面的分支仍会把它当旧版本。
-        d = state["done"].get(key)
-        if isinstance(d, dict) and (d.get("dry") or d.get("src") == "empty"):
-            log(f"  ↻ {log_name} {date} 清理历史 "
-                f"{'dry-run' if d.get('dry') else 'empty'} 记录，重新处理")
-            state["done"].pop(key, None)
-            d = None
+            # ★★ 统一在这里清掉「从没真正推过实例」的历史 done，**必须早于
+            #    本 key 的一切指纹比较**（包括下面「无测量值」那条路径）。
+            #    这两个状态不是「PACS 里已有这个版本」：
+            #      · dry-run 记录（旧 bug 写的 {"dry": true, ...}）
+            #      · src="empty"（当时没有任何可录入的测量值，一个实例都没发）
+            #    拿它们跟当前指纹比会出两种错：
+            #      fp 相同 → 当成已完成，病例永久冻结；
+            #      fp 不同 → 当成「已推旧内容」而无谓转 stale 等人处理，
+            #                可它其实一次都没发过。
+            #    以前清理只放在「有测量值」那条路径里，于是「dry done + 当前
+            #    无测量值」会先在上面的 emptied 分支造出错误 stale 并 continue，
+            #    永远走不到清理。所以这里提前，且 d 置 None —— 只从字典 pop
+            #    而留着 d，后面的分支仍会把它当旧版本。
+            d = state["done"].get(key)
+            if isinstance(d, dict) and (d.get("dry") or d.get("src") == "empty"):
+                log(f"  ↻ {log_name} {date} 清理历史 "
+                    f"{'dry-run' if d.get('dry') else 'empty'} 记录，重新处理")
+                state["done"].pop(key, None)
+                d = None
 
-        # ★ 判据从「有没有眼」改成「有没有可录入的测量值」。
-        #   以前 _record 缺一项就丢整眼，于是「有 AL 无 K」的检查在这里
-        #   被判成没数据、整条跳过 —— 连眼轴都录不进 OAM。
-        #   现在只要有一眼有 AL（→OAM）或 r1+r2（→KER）就照常处理，
-        #   度数算不出来只是不出晶体单。
-        if not rec["eyes"] or not calc.has_measurement(rec):
-            # ★ 已推过的病例变成「无有效测量值」（测量值被清空、或同日
-            #   新建了一条更空的记录被选中）：不能静默跳过。以前这里
-            #   直接 continue，既不进 stale、audit 也不算 checked，看起来
-            #   一切正常，而 PACS 里仍留着旧内容。
-            # 到这里 d 一定不是 dry/empty（上面已清理并置 None）
-            if isinstance(d, dict):
-                fp0 = _fingerprint(rec)
-                if d.get("fp") and d.get("fp") != fp0:
-                    prev = stale.get(key) or {}
-                    if prev.get("now_fp") != fp0:
-                        stale_n += 1
-                        log(f"  ⚠ {log_name} {date} 已推内容现在没有有效测量值"
-                            f"（数据被清空？），PACS 里仍是旧版")
-                    stale[key] = {
-                        "t": _now(), "date": date, "name": name,
-                        "was_fp": d.get("fp"), "now_fp": fp0,
-                        "was": {k: d.get(k) for k in
-                                ("instances", "sc", "oam_eyes", "ker_eyes")},
-                        "now_instances": 0, "from": "emptied",
-                    }
-            # 库中这条检查确实没有任何可录入的测量值（只有眼状态/ACD，
-            # 或全是 0）。重试也没用，但要留痕 —— 否则它会一直挂在
-            # failed 里反复触发到期重试，每 interval 白读一次全库。
-            fp_empty = _fingerprint(rec)
-            if isinstance(fr, dict):
-                # ★ 之前发出去过旧内容、现在数据被清空 → 必须人工处理。
-                #   不能只标 permanent 了事：PACS 里那批实例还在。
-                landed = bool(fr.get("sent_uids") or fr.get("maybe_uids")
-                              or fr.get("uncertain"))
-                # ★ 有接收历史时：fp 缺失 = 无法确认版本 → 也算「变了」，
-                #   必须转人工。缺 fp 绝不能当成「和当前空记录相同」。
-                fp_changed_or_unknown = (
-                    landed and (fr.get("fp") is None
-                                or fr.get("fp") != fp_empty))
-                if fp_changed_or_unknown:
-                    prev = stale.get(key) or {}
-                    if prev.get("now_fp") != fp_empty:
-                        stale_n += 1
-                        log(f"  ⚠ {log_name} {date} 已推送过实例但数据被清空，"
-                            f"PACS 里仍是旧版")
-                    stale[key] = {
-                        "t": _now(), "date": date, "name": name,
-                        "was_fp": fr.get("fp"), "now_fp": fp_empty,
-                        "was": {"instances": fr.get("expect"),
-                                "sent": fr.get("sent"),
-                                "sent_uids": fr.get("sent_uids"),
-                                "maybe_uids": fr.get("maybe_uids"),
-                                "uncertain": fr.get("uncertain")},
-                        "now_instances": 0, "from": "failed",
-                    }
-                    state["failed"].pop(key, None)
-                else:
-                    # ★ fp 与 perm_fp 是**两个不同的东西**，不能共用一个字段：
-                    #     fp      = 上次尝试发送的那一版内容（接收历史的基线）
-                    #     perm_fp = 造成「永久失败」的那份输入
-                    #   以前只有 fp，于是「A 版失败 → 清空（标 permanent）
-                    #   → 恢复完全相同的 A 版」时 fp 没变，changed=False，
-                    #   仍然 continue —— 而让 permanent 成立的原因（没有
-                    #   测量值）其实已经消失了，病例又被冻结。
-                    fr["perm_fp"] = fp_empty
-                    fr["permanent"] = True
-                    fr["err"] = fr.get("err") or "库中该检查无有效测量值"
-                    fr["next"] = 0
-            cooling.pop(key, None)
-            continue
+            # ★ 一行 = 一个案例：不再选行，这一行就是这一例。
+            #   同一天测两轮的，两行各自成案例、各自出单，互不覆盖
+            #   （幂等键 guid|exam_date，study UID 用 uid_seed 区分）。
+            rec = _record(row, name)
 
-        # ---------------- 幂等键：内容指纹 ----------------
-        # ★ 设备的幂等键是「姓|名|检查日期」，不含数据内容。设备对同一次
-        #   检查补测时**改写同一行、guid 不变**，于是 MDB 签名变了、这行
-        #   也扫到了，但 key 命中 done 就再也不会被处理 —— 病例永久停在
-        #   半成品状态（生产 2026-11-10 已实际发生一次）。
-        #   现在 done 里存 fp，比对的是「内容」而不是「这例处理过没有」。
-        fp = _fingerprint(rec)
-        if isinstance(d, dict):
-            old = d.get("fp")
-            if old == fp:
-                stale.pop(key, None)
-                cooling.pop(key, None)
-                continue                     # 内容没变，真·已推过
-            if not old:
-                # ★ 老 state（本改动之前写的 done）没有 fp。这里把
-                #   **当前**内容认作「已推过」，就地补指纹，**不重推**
-                #   —— 否则升级即全量重推，而 PACS 会按同
-                #   SOP UID 静默去重，白打一遍网络还给不出任何新内容。
-                #   代价：升级前已经发生的补测查不出来（个别已
-                #   人工修复）。要核对历史用 audit。
-                d["fp"] = fp
-                backfill_n += 1
+            pending = state.get("pending", {}).get(key)
+            if (pending and isinstance(fr, dict) and fr.get('permanent') and
+                    not pending.get('ready') and
+                    not os.path.exists(pending['rec']['_spool']) and
+                    _fingerprint(rec) != pending['fp']):
+                # No published payload and no durable ready => no C-STORE was
+                # possible. A corrected DOB/source can safely replace this input.
+                # Published/maybe-sent payloads must never take this shortcut.
+                log(f"  ↻ {log_name} {date} 未发送输入已修正，重新准备同一轮")
+                state['pending'].pop(key)
+                state['failed'].pop(key, None)
+                pending, fr = None, None
+            if pending:
+                if pending["target"] != push_target:
+                    raise ValueError("pending round target changed; refusing to send")
+                if isinstance(fr, dict) and (fr.get("permanent") or _wait_left(fr) > 0):
+                    continue
+                todo.append((date, key, copy.deepcopy(pending["rec"]),
+                             pending["fp"], pending["uid_seed"]))
                 continue
 
-        # ---------------- 人工处理状态（stale）优先于一切 ----------------
-        # ★ stale 一旦写入，就是**持续生效**的人工闸门：不管它来自 done
-        #   变更、来自 failed 的部分接收、还是来自「已推内容被清空」，
-        #   只要内容还没变回 PACS 里已有的那一版，就绝不能再自动发送。
-        #
-        #   这是上一轮的漏洞：从 failed 转 stale 时删掉了 failed，下一轮
-        #   该 key 既无 done 也无 failed → 直接进 todo → 发送成功并清掉
-        #   stale，等于「只挡住一次扫描」。
-        s_prev = stale.get(key)
-        if isinstance(s_prev, dict):
-            if s_prev.get("was_fp") == fp:
-                # 内容又变回「之前那一版」→ 解除人工拦截。
-                #
-                # ⚠️ 但这**不等于**「PACS 里已有完整的那一版」：
-                #    · 从 done 来的 stale：done.fp 曾记录过它，说明确实推成过
-                #      完整版本（前面 done 判定已经处理了这条路径）。
-                #    · 从 failed 来的 stale：was_fp 那一版**只部分接收**，
-                #      甚至只是"可能接收"。此时必须把当时的接收历史
-                #      挪回 failed，否则下一轮同内容重试若明确全失败，
-                #      历史就丢了，之后内容一变又会普通重试、同 UID 去重。
-                was = s_prev.get("was") or {}
-                if s_prev.get("from") == "failed":
-                    landed = bool(was.get("sent_uids") or was.get("maybe_uids")
-                                  or was.get("uncertain"))
-                    if landed:
-                        state["failed"][key] = {
-                            "t": _now(), "date": date, "fp": s_prev["was_fp"],
-                            "err": "内容回到曾部分接收的版本，按退避重试补齐",
-                            "tries": 0, "next": 0,
-                            "sent_uids": list(was.get("sent_uids") or []),
-                            "maybe_uids": list(was.get("maybe_uids") or []),
-                            "sent": int(was.get("sent") or 0),
-                            "uncertain": bool(was.get("uncertain")),
-                            "expect": was.get("instances"),
+            if isinstance(fr, dict) and (fr.get("sent_uids") or fr.get("maybe_uids") or fr.get("uncertain")):
+                log(f"ERROR {log_name} {date} 升级前部分接收缺少不可变载荷；保留记录并停止该例")
+                blocked_cases += 1
+                continue
+
+            current_fp = _fingerprint(rec)
+            previous_stale = stale.get(key)
+            changed_done = isinstance(d, dict) and d.get("fp") and d["fp"] != current_fp
+            if calc.has_measurement(rec) and (changed_done or previous_stale):
+                # Legacy partial sends have no frozen source/payload. A new round
+                # cannot complete that historical round; retain the safety gate.
+                if (previous_stale or {}).get("from") in ("failed", "pid_mismatch"):
+                    log(f"ERROR {log_name} {date} 旧部分接收/身份记录缺原始载荷，安全阻止自动补测")
+                    blocked_cases += 1
+                    continue
+                if d and d.get("fp") == current_fp:
+                    stale.pop(key, None)
+                    continue
+                if not d:
+                    log(f"ERROR {log_name} {date} stale 缺少 done，无法确认原 study；停止该例")
+                    blocked_cases += 1
+                    continue
+                if patient.make_pid(rec.get("dob"), name) != d.get("pid"):
+                    log(f"ERROR {log_name} {date} PatientID 变化，无法安全归入原 study；停止该例")
+                    blocked_cases += 1
+                    continue
+                original_study = dicom.study_uid_for(d["pid"], date, str(d.get("uid_seed") or ""))
+                if (d.get("date") not in (None, date) or
+                    (d.get("study_uid") and d["study_uid"] != original_study) or
+                    study_owners.get(original_study, {key}) != {key}):
+                    log(f"ERROR {log_name} {date} study 归属/日期冲突，停止该例")
+                    blocked_cases += 1
+                    continue
+                if isinstance(fr, dict) and _wait_left(fr) > 0:
+                    continue
+                if isinstance(fr, dict) and fr.get("permanent") and fr.get("perm_fp") == current_fp:
+                    blocked_cases += 1
+                    continue
+                log(f"  ↻ {log_name} {date} 补测排队，保留历史，新增 Rec {revisions.number(d.get('revision', 1)) + 1}")
+                seed = str(d.get("uid_seed") or "")
+                todo.append((date, key, rec, current_fp, seed))
+                continue
+
+            # ★ v1.3.3：不再按「采集日 vs exam_date」拦任何行。
+            #   一行 = 一个案例，这一行就是它自己那次检查；采集日与
+            #   exam_date 不同是设备的业务行为，不是错误。所以这里直接
+            #   走下面的「信息是否充足」判定 —— 有 AL 或 r1+r2 就出单，
+            #   没有就按既有规则跳过。
+            #   旧跨天闸门可能误拦独立案例，现已移除。
+
+            # ★ 判据从「有没有眼」改成「有没有可录入的测量值」。
+            #   以前 _record 缺一项就丢整眼，于是「有 AL 无 K」的检查在这里
+            #   被判成没数据、整条跳过 —— 连眼轴都录不进 OAM。
+            #   现在只要有一眼有 AL（→OAM）或 r1+r2（→KER）就照常处理，
+            #   度数算不出来只是不出晶体单。
+            if not rec["eyes"] or not calc.has_measurement(rec):
+                # ★ 已推过的病例变成「无有效测量值」（测量值被清空、或同日
+                #   新建了一条更空的记录被选中）：不能静默跳过。以前这里
+                #   直接 continue，既不进 stale、audit 也不算 checked，看起来
+                #   一切正常，而 PACS 里仍留着旧内容。
+                # 到这里 d 一定不是 dry/empty（上面已清理并置 None）
+                if isinstance(d, dict):
+                    fp0 = _fingerprint(rec)
+                    # ★ 缺 fp 不能当成「和现在一样」。老 state（本改动之前写的
+                    #   done）没有指纹，此时「PACS 里是哪一版」是**未知**——
+                    #   而这条 done 一定发过实例（dry/empty 已在上面清掉），
+                    #   所以不能静默跳过，必须转人工。
+                    #   这与下面 failed 分支的判据是同一个原则：
+                    #       landed and (fr.get("fp") is None or fr.get("fp") != fp_empty)
+                    #   以前这里只判 d.get("fp") 为真且不同，于是「老记录 +
+                    #   现在选到空行」既不留痕也不补指纹，audit 反复报同一批。
+                    if d.get("fp") is None or d.get("fp") != fp0:
+                        prev = stale.get(key) or {}
+                        if prev.get("now_fp") != fp0:
+                            stale_n += 1
+                            log(f"  ⚠ {log_name} {date} 已推内容现在没有有效测量值"
+                                f"（数据被清空？），PACS 里仍是旧版")
+                        stale[key] = {
+                            "t": _now(), "date": date, "name": name,
+                            "was_fp": d.get("fp"), "now_fp": fp0,
+                            "was": {k: d.get(k) for k in
+                                    ("instances", "sc", "oam_eyes", "ker_eyes")},
+                            "now_instances": 0, "from": "emptied",
                         }
-                        log(f"  ✓ {log_name} {date} 数据已回到 PACS 现有版本，"
-                            f"解除待确认（保留已接收记录，按退避补齐）")
-                        stale.pop(key, None)
-                        cooling.pop(key, None)
-                        # ★ 必须留到下一轮：本轮刚恢复的 failed 记录还没被
-                        #   读取（fr 是更早取的），直接放行会绕过退避，
-                        #   而且失败时也拿不到刚恢复的历史。
-                        continue
+                # 库中这条检查确实没有任何可录入的测量值（只有眼状态/ACD，
+                # 或全是 0）。重试也没用，但要留痕 —— 否则它会一直挂在
+                # failed 里反复触发到期重试，每 interval 白读一次全库。
+                fp_empty = _fingerprint(rec)
+                if isinstance(fr, dict):
+                    # ★ 之前发出去过旧内容、现在数据被清空 → 必须人工处理。
+                    #   不能只标 permanent 了事：PACS 里那批实例还在。
+                    landed = bool(fr.get("sent_uids") or fr.get("maybe_uids")
+                                  or fr.get("uncertain"))
+                    # ★ 有接收历史时：fp 缺失 = 无法确认版本 → 也算「变了」，
+                    #   必须转人工。缺 fp 绝不能当成「和当前空记录相同」。
+                    fp_changed_or_unknown = (
+                        landed and (fr.get("fp") is None
+                                    or fr.get("fp") != fp_empty))
+                    if fp_changed_or_unknown:
+                        prev = stale.get(key) or {}
+                        if prev.get("now_fp") != fp_empty:
+                            stale_n += 1
+                            log(f"  ⚠ {log_name} {date} 已推送过实例但数据被清空，"
+                                f"PACS 里仍是旧版")
+                        stale[key] = {
+                            "t": _now(), "date": date, "name": name,
+                            "was_fp": fr.get("fp"), "now_fp": fp_empty,
+                            "was": {"instances": fr.get("expect"),
+                                    "sent": fr.get("sent"),
+                                    "sent_uids": fr.get("sent_uids"),
+                                    "maybe_uids": fr.get("maybe_uids"),
+                                    "uncertain": fr.get("uncertain")},
+                            "now_instances": 0, "from": "failed",
+                        }
+                        state["failed"].pop(key, None)
                     else:
-                        log(f"  ✓ {log_name} {date} 数据已回到 PACS 现有版本，"
-                            f"解除待确认")
-                else:
-                    log(f"  ✓ {log_name} {date} 数据已回到 PACS 现有版本，解除待确认")
-                stale.pop(key, None)
-            else:
-                if s_prev.get("now_fp") != fp:
-                    s_prev["now_fp"] = fp
-                    stale_n += 1
-                    log(f"  ⚠ {log_name} {date} 数据仍在更新，PACS 里是旧版，"
-                        f"需人工确认后重推（已跳过自动发送）")
+                        # ★ fp 与 perm_fp 是**两个不同的东西**，不能共用一个字段：
+                        #     fp      = 上次尝试发送的那一版内容（接收历史的基线）
+                        #     perm_fp = 造成「永久失败」的那份输入
+                        #   以前只有 fp，于是「A 版失败 → 清空（标 permanent）
+                        #   → 恢复完全相同的 A 版」时 fp 没变，changed=False，
+                        #   仍然 continue —— 而让 permanent 成立的原因（没有
+                        #   测量值）其实已经消失了，病例又被冻结。
+                        fr["perm_fp"] = fp_empty
+                        fr["permanent"] = True
+                        fr["err"] = fr.get("err") or "库中该检查无有效测量值"
+                        fr["next"] = 0
                 cooling.pop(key, None)
                 continue
 
-        # ---------------- 失败退避 ----------------
-        if isinstance(fr, dict):
-            # ★ 上一次的尝试可能已经把**旧内容**的一部分送进了 PACS：
-            #   确认接收（sent_uids）或结果未知（maybe_uids / uncertain）。
-            #   内容一旦变化就绝不能按普通失败重试 —— 重试会用同一批 SOP
-            #   UID 推新内容，PACS 保留首个（旧内容）却返回成功，账目记成
-            #   新内容齐全、PACS 还是旧数据，连 audit 都查不出来。
-            landed = bool(fr.get("sent_uids") or fr.get("maybe_uids")
-                          or fr.get("uncertain"))
-            fp_prev = fr.get("fp")           # 上次**尝试发送**的那一版
-            perm_fp = fr.get("perm_fp")      # 造成「永久失败」的那份输入
-
-            def _to_stale(why, was_fp):
-                """把这一例转成人工处理，保留接收历史。"""
-                nonlocal stale_n
-                stale_n += 1
-                log(f"  ⚠ {log_name} {date} {why}，需人工确认后重推")
-                stale[key] = {
-                    "t": _now(), "date": date, "name": name,
-                    "was_fp": was_fp, "now_fp": fp,
-                    "was": {"instances": fr.get("expect"),
-                            "sent": fr.get("sent"),
-                            "sent_uids": fr.get("sent_uids"),
-                            "maybe_uids": fr.get("maybe_uids"),
-                            "uncertain": fr.get("uncertain")},
-                    "now_instances": None,
-                    "from": "failed",
-                }
-                cooling.pop(key, None)
-                state["failed"].pop(key, None)
-
-            # ★ permanent 只对「造成它的那份输入」有效，判据是 perm_fp
-            #   而不是 fp：两者含义不同（见无测量值分支的说明）。
-            #   老记录没有 perm_fp（HEAD 的失败返回根本不带指纹），此时
-            #   「输入有没有变」是**未知**，不是「没变」—— 必须重新评估
-            #   一次，否则补齐生日/补测之后仍然永久跳过。
-            if fr.get("permanent"):
-                unchanged = perm_fp is not None and perm_fp == fp
-                if unchanged:
-                    continue                 # 输入没变，确定失败，重试无意义
-                if landed:
-                    # 旧内容可能已经在 PACS 里 → 人工处理（不自动重发）
-                    _to_stale("曾经的失败已推送过实例（旧内容），"
-                              "输入已变化但无法确认", fp_prev)
+            # ---------------- 幂等键：内容指纹 ----------------
+            # ★ 行级幂等键是 guid|exam_date，不含数据内容。设备对同一次
+            #   检查补测时**改写同一行、guid 不变**，于是 MDB 签名变了、这行
+            #   也扫到了，但 key 命中 done 就再也不会被处理 —— 病例永久停在
+            #   半成品状态。
+            #   现在 done 里存 fp，比对的是「内容」而不是「这例处理过没有」。
+            fp = _fingerprint(rec)
+            if isinstance(d, dict):
+                old = d.get("fp")
+                if old == fp:
+                    stale.pop(key, None)
+                    cooling.pop(key, None)
+                    continue                     # 内容没变，真·已推过
+                if not old:
+                    # ★ 老 state（本改动之前写的 done）没有 fp。这里把
+                    #   **当前**内容认作「已推过」，就地补指纹，**不重推**
+                    #   —— 否则升级可能触发历史记录全量重推，而 PACS 会按同
+                    #   SOP UID 静默去重，白打一遍网络还给不出任何新内容。
+                    #   代价：无法从缺失指纹推断升级前是否发生过补测。
+                    # ★ 补指纹 = 把**当前内容**登记成「PACS 里已有这一版」。
+                    #
+                    # ★ 生日对不上怎么办：**只留痕，不拦、不排队**。
+                    #   使用者口径：「数据对不上就不要硬核对」「就当是两个人就行」。
+                    #   同日同名两行生日不同 = 两条独立记录，管线不替人判断谁对。
+                    #   以前这里写 stale[from="pid_mismatch"]，会使此类记录长期
+                    #   挂在 audit 里等人处理 —— 而人也不该去"核对"一个业务上
+                    #   本来就允许存在的两种记录。
+                    #   现在只打一行日志，照常补指纹（不推、不动 PACS）。
+                    was_pid = d.get("pid")
+                    now_pid = patient.make_pid(rec.get("dob"), name)
+                    if was_pid and now_pid and was_pid != now_pid:
+                        log(f"  · {log_name} {date} 已推记录与当前行的 PatientID "
+                            f"不同，按当前内容登记基线（当两条独立记录处理）")
+                    d["fp"] = fp
+                    backfill_n += 1
                     continue
-                # 无接收历史 → 解除 permanent，重新走完整流程（含冷却）
-                log(f"  ↻ {log_name} {date} 输入已变化或未知，"
-                    f"解除永久失败，重新处理")
-                state["failed"].pop(key, None)
-                fr = None
-                retry_n += 1
 
+            if stale.get(key):
+                log(f"ERROR {log_name} {date} 旧 stale 无法安全自动恢复，保留现场并停止该例")
+                blocked_cases += 1
+                continue
+
+            # ---------------- 失败退避 ----------------
             if isinstance(fr, dict):
-                # ★ 有接收历史时，只要**不能证明**「现在的内容和当初发出去
-                #   的一样」就必须转人工：
-                #     · fp 缺失（HEAD 的失败返回不带指纹）= 无法确认 → 未知；
-                #     · fp 不同 = 确定变了。
-                #   None != fp 恒为真，所以缺 fp 自然落进来，无需单独分支。
-                #   若把「缺 fp」当成「相同」去重推，PACS 会按同 UID 静默
-                #   去重并返回成功，账目记成新版齐全而 PACS 仍是旧内容 ——
-                #   正是本次事故的形态。
-                if landed and fp_prev != fp:
-                    _to_stale(
-                        "上次已推送实例但无法确认内容版本" if fp_prev is None
-                        else "上次已推送部分实例（旧内容），数据又更新了",
-                        fp_prev)
+                # Legacy receive evidence was blocked above; new rounds always
+                # have pending. Only never-sent historical failures reach here.
+                if fr.get("permanent"):
+                    if fr.get("perm_fp") == fp:
+                        blocked_cases += 1
+                        log(f"ERROR {log_name} {date} 永久失败尚未修复: {fr.get('err', '')}")
+                        continue
+                    log(f"  ↻ {log_name} {date} 未发送输入已变化，解除永久失败")
+                    state["failed"].pop(key, None)
+                    fr = None
+                    retry_n += 1
+                if isinstance(fr, dict):
+                    if _wait_left(fr) > 0:
+                        wait_n += 1
+                        continue
+                    retry_n += 1
+
+            # ---------------- 冷却期 ----------------
+            # ★ 数据源没有「这次检查已结束」这个事件：MDB 是可变快照，设备
+            #   随时会补测改写。所以「推之前先等一会儿」是唯一能降低押错概率
+            #   的手段。起点见上方说明：优先 measure_ts，缺失时退回 first。
+            if cooling_s > 0:
+                c = cooling.get(key)
+                if not isinstance(c, dict) or c.get("fp") != fp:
+                    c = {"fp": fp, "first": now}
+                    cooling[key] = c
+                # ★ 起点：有创建时刻就用它，**不要**再跟 first 取 max。
+                #   历史积压（首次启动时库里已有的记录）的 measure_ts
+                #   可能是几个月前，跟 first=now 取 max 会让它们全部无谓地
+                #   再等一个冷却期，白白推迟整批补推。
+                #   measure_ts 缺失（guid 格式变了）时才退回用 first 兜底。
+                ts = row.get("measure_ts")
+                start = float(ts) if ts else float(c.get("first") or now)
+                ready = start + cooling_s
+                # 记下到期时刻，_next_cool_ready() 直接取用（不在返回值里现算
+                # measure_ts，避免同一条被反复解析）。
+                c["ready"] = ready
+                if ready > now:
+                    cooling_n += 1
                     continue
-                if _wait_left(fr) > 0:
-                    wait_n += 1
-                    continue                 # 退避中，还没到点
-                retry_n += 1
 
-        # ---------------- 冷却期 ----------------
-        # ★ 数据源没有「这次检查已结束」这个事件：MDB 是可变快照，设备
-        #   随时会补测改写。所以「推之前先等一会儿」是唯一能降低押错概率
-        #   的手段。起点见上方说明：优先 measure_ts，缺失时退回 first。
-        if cooling_s > 0:
-            c = cooling.get(key)
-            if not isinstance(c, dict) or c.get("fp") != fp:
-                c = {"fp": fp, "first": now}
-                cooling[key] = c
-            # ★ 起点：有创建时刻就用它，**不要**再跟 first 取 max。
-            #   历史积压（首次启动时库里已有的旧检查）的 measure_ts
-            #   可能是几个月前，跟 first=now 取 max 会让它们全部无谓地
-            #   再等一个冷却期，白白推迟整批补推。
-            #   measure_ts 缺失（guid 格式变了）时才退回用 first 兜底。
-            ts = row.get("measure_ts")
-            start = float(ts) if ts else float(c.get("first") or now)
-            ready = start + cooling_s
-            # 记下到期时刻，_next_cool_ready() 直接取用（不在返回值里现算
-            # measure_ts，避免同一条被反复解析）。
-            c["ready"] = ready
-            if ready > now:
-                cooling_n += 1
-                continue
-
-        # ---------------- 内容变了，但先不自动重推 ----------------
-        # ⚠️ OAM/KER 的 SOP Instance UID 只由 study + 布局版本派生，不含
-        #    内容。同 UID 不同内容推上去，PACS 默认保留首个并**返回成功**
-        #    —— 结果会是「推送成功、state 记 6 实例齐全、PACS 里还是旧的
-        #    单眼版本」，比现在卡住更难查。先留痕，由 audit/repair 显式处理。
-        if isinstance(d, dict) and d.get("fp"):
-            prev = stale.get(key) or {}
-            if prev.get("now_fp") != fp:
-                stale_n += 1
-                log(f"  ⚠ {log_name} {date} 数据已更新（补测），"
-                    f"PACS 内容仍是旧版，需人工确认后重推")
-            try:
-                calc.calc_record(rec, lenses, target=target, step=step)
-                now_n = _expected_instances(rec, lenses)
-            except Exception:
-                now_n = None
-            stale[key] = {
-                "t": _now(), "date": date, "name": name,
-                "was_fp": d.get("fp"), "now_fp": fp,
-                "was": {k: d.get(k) for k in
-                        ("instances", "sc", "oam_eyes", "ker_eyes")},
-                "now_instances": now_n,
-            }
-            cooling.pop(key, None)
-            continue
-
-        todo.append((date, key, rec, fp))
+            # 新案例用 guid 作 study 种子：与任何已推内容的 UID 都不同，
+            # 保证「同一天第二轮」能真正进 PACS，而不是被静默去重。
+            if isinstance(d, dict):
+                uid_seed = str(d.get("uid_seed") or "")
+            else:
+                uid_seed = str(row.get("guid") or "")
+            todo.append((date, key, rec, fp, uid_seed))
 
     # ★ failed 里指向已不在库中的检查（设备归档/清库）：重试无从下手。
     #   不清理的话「有到期待重试」会永远为真 —— 每轮白读一次全库、白起
     #   一次进程池，而那条记录永远不会成功。dry-run 不动 state。
     if not args.dry_run:
-        orphan = [k for k in state["failed"] if k not in live]
+        orphan = [k for k, fr in state["failed"].items()
+                  if k not in live and k not in state.get("pending", {})
+                  and not (fr.get('sent_uids') or fr.get('maybe_uids') or fr.get('uncertain'))]
         if orphan:
             for k in orphan:
                 state["failed"].pop(k, None)
             log(f"failed 队列清理 {len(orphan)} 条（库中已无对应检查，"
                 f"无从重试）")
-        # cooling / stale 同样要清：设备归档或清库后这些 key 不会再出现，
-        # 留着只会让 state 无限膨胀，也让「还有多少例在等」的数字失真。
-        for book, label in ((cooling, "cooling"), (stale, "stale")):
+        # Only scheduling hints can be discarded. Stale/receive evidence must
+        # survive archival: absence from MDB is not proof of PACS convergence.
+        for book, label in ((cooling, "cooling"),):
             gone = [k for k in book if k not in live]
             if gone:
                 for k in gone:
                     book.pop(k, None)
                 log(f"{label} 队列清理 {len(gone)} 条（库中已无对应检查）")
+        lost = (set(stale) | set(state['failed'])) - live - set(state.get('pending', {}))
+        if lost:
+            blocked_cases += len(lost)
+            log(f"ERROR {len(lost)} 条异常记录已不在 MDB，保留 stale/接收历史，未宣告收敛")
+
+    # Finish already-started immutable rounds even if MDB archived their rows.
+    for key, pending in state.get("pending", {}).items():
+        if key in live:
+            continue
+        fr = state["failed"].get(key) or {}
+        if fr.get("permanent") or _wait_left(fr) > 0:
+            continue
+        if args.since and pending["date"] < args.since:
+            continue
+        todo.append((pending["date"], key, copy.deepcopy(pending["rec"]),
+                     pending["fp"], pending["uid_seed"]))
 
     # 新检查优先：今天拍的片子医生在 PACS 里等着看
     todo.sort(key=lambda x: x[0], reverse=True)
+    if not args.dry_run:
+        # Limit/budget must not consume the only mtime event for unstarted work.
+        for date, key, rec, fp, seed in todo:
+            if key not in state.get("pending", {}):
+                cooling[key] = {"fp": fp, "first": now, "ready": now}
     if args.limit:
         todo = todo[:args.limit]
     _extra = (f"，其中到期重试 {retry_n} 例" if retry_n else "") + \
@@ -981,7 +1178,7 @@ def run_once(cfg, lenses, meta, state, args, push_target):
 
     def _finish(st):
         out = {"cooling": len(cooling), "stale": len(stale),
-               "next_ready": _next_cool_ready()}
+               "next_ready": _next_cool_ready(), "blocked_cases": blocked_cases}
         out.update(st)
         return out
 
@@ -1003,17 +1200,54 @@ def run_once(cfg, lenses, meta, state, args, push_target):
     def commit(res):
         nonlocal total_ok
         key, good, info, errs, lines = res
+        if good and info.get("prepared") and not args.dry_run:
+            pending = state["pending"][key]
+            # This second durable boundary distinguishes an unbuilt round from
+            # a lost payload. All retries must use the already published bytes.
+            pending["ready"] = True
+            _save_state(args.state, state)
+            try:
+                datasets, saved = revisions.read_payload(pending["rec"]["_spool"])
+                revisions.validate_journal(saved, pending['rec'], pending['fp'], pending['uid_seed'])
+            except Exception as e:
+                good, info = False, {"fp": pending["fp"], "permanent": True,
+                                     "perm_fp": pending["fp"], "err": f"载荷校验失败，停止该轮: {e}"}
+            else:
+                key, good, info, errs, lines = _send_round(key, datasets, saved, push_target, lines)
         for ln in lines:
             log(ln)
         note = None                       # 退避相关的日志留到锁外打
         with lock:
             if good:
                 if not args.dry_run:
+                    pending = state.get("pending", {}).get(key)
+                    previous = state["done"].get(key) or {}
+                    if pending and previous:
+                        info["history"] = list(previous.get("history") or []) + [
+                            {**{k: previous.get(k) for k in
+                             ("fp", "instances", "t", "study_uid", "sop_uids", "payload_sha256")},
+                             'revision': previous.get('revision', 1)}]
                     state["done"][key] = info
+                    state.setdefault("pending", {}).pop(key, None)
                     state["failed"].pop(key, None)
                     # 推成功了：冷却与 stale 都不该再留着这一条
                     state.setdefault("cooling", {}).pop(key, None)
                     state.setdefault("stale", {}).pop(key, None)
+                    if pending:
+                        # A frozen round may finish after the source changed.
+                        # Wake watch for a fresh MDB scan without waiting for mtime.
+                        state.setdefault("cooling", {})[key] = {
+                            "fp": info.get("fp"), "ready": time.time(), "first": time.time()}
+                    _save_state(args.state, state)
+                    if pending:
+                        log(f"OK {info.get('label') or log_label(key)} {info['date']} Rec {info['revision']} "
+                            f"{info['instances']} 实例齐全，done 已持久化")
+                    if pending:
+                        import shutil
+                        try:
+                            shutil.rmtree(pending["rec"]["_spool"])
+                        except OSError as e:
+                            log(f"WARN 已完成轮次本地载荷清理失败（不影响 PACS）: {e}")
                 stats["ok"] += 1
             else:
                 # ★ 单例失败要退避：PACS 半通（端口开、关联被拒 / 部分成功）
@@ -1051,9 +1285,9 @@ def run_once(cfg, lenses, meta, state, args, push_target):
                     if not info.get("perm_fp") and info.get("fp"):
                         info["perm_fp"] = info["fp"]
                     info["next"] = 0
-                    note = (f"  ⊘ {key} 确定失败"
+                    note = (f"ERROR {log_label(key)} 确定失败"
                             f"（{str(info.get('err', ''))[:80]}），不再重试"
-                            f"（改配置/型号后 state 重置会重来一次）")
+                            f"（保留原账与载荷；修复根因后恢复该轮，禁止清空 state）")
                 else:
                     delay = _backoff(pol, tries)
                     info["next"] = time.time() + delay
@@ -1088,7 +1322,9 @@ def run_once(cfg, lenses, meta, state, args, push_target):
                 log(f"本轮预算 {args.max_seconds}s 用尽，已处理 {idx - 1}/{len(todo)}，"
                     f"剩余 {len(todo) - idx + 1} 例下轮继续")
                 break
-            log(f"[{idx}/{len(todo)}] {task[2]['name']} {task[0]}")
+            log(f"[{idx}/{len(todo)}] {log_label(task[2]['name'])} {task[0]}")
+            if not args.dry_run:
+                task = _reserve_round(task, state, args.state, push_target, cfg, lenses, meta)
             commit(_process_one(task, cfg, lenses, meta, push_target, args.dry_run))
     else:
         # 并发：有界窗口。★ 预算检查放在**提交点**，所以新检查（todo 已按
@@ -1101,7 +1337,7 @@ def run_once(cfg, lenses, meta, state, args, push_target):
             stop_submit = False   # 预算用尽或池失效后不再提交
 
             def fail_task(task, err):
-                log(f"✗ {task[2]['name']} {task[0]} 子进程异常: {err}")
+                log(f"✗ {log_label(task[2]['name'])} {task[0]} 子进程异常: {err}")
                 with lock:
                     # 子进程异常（OOM 被杀、段错误）也是可重试失败，同样进退避：
                     # 大量任务同时炸时不该让下一轮立刻又把它们全渲一遍。
@@ -1109,10 +1345,8 @@ def run_once(cfg, lenses, meta, state, args, push_target):
                     tries = int((prev or {}).get("tries") or 0) + 1 \
                         if isinstance(prev, dict) else 1
                     delay = _backoff(pol, tries)
-                    # ★ 子进程异常 = 我们不知道它推了多少。可能已经发出
-                    #   一部分实例，然后进程被杀。必须按「可能已接收」
-                    #   记录（uncertain），并把该内容版本的接收历史带过来
-                    #   —— 否则下一轮内容一变就会普通重试，同 UID 去重。
+                    # v1.3.4 worker 不联网。保留父进程此前尝试的接收历史；
+                    # 崩溃后仍由 pending 的固定载荷/轮次恢复。
                     keep = {}
                     if isinstance(prev, dict) and prev.get("fp") == task[3]:
                         for f in ("sent_uids", "maybe_uids"):
@@ -1125,7 +1359,7 @@ def run_once(cfg, lenses, meta, state, args, push_target):
                         "fp": task[3],
                         "err": f"子进程异常: {err}"[:200],
                         "tries": tries, "next": time.time() + delay,
-                        "uncertain": True,
+                        "uncertain": bool((prev or {}).get('uncertain')),
                         **keep}
                     # ★ 与 commit() 的失败分支保持一致：把 cooling 摘掉，
                     #   由 failed.next 接管。漏了这里的话，cooling 里会
@@ -1143,6 +1377,8 @@ def run_once(cfg, lenses, meta, state, args, push_target):
                         stop_submit = True
                         return True
                     task = todo[cursor]
+                    if not args.dry_run:
+                        task = _reserve_round(task, state, args.state, push_target, cfg, lenses, meta)
                     try:
                         fut = ex.submit(_process_one, task, cfg, lenses, meta,
                                         push_target, args.dry_run)
@@ -1163,9 +1399,11 @@ def run_once(cfg, lenses, meta, state, args, push_target):
                 for fut in done:
                     task = pending.pop(fut)
                     try:
-                        commit(fut.result())
+                        result = fut.result()
                     except Exception as e:
                         fail_task(task, e)
+                    else:
+                        commit(result)
                 if not alive:
                     continue
                 alive = fill()
@@ -1181,14 +1419,17 @@ def run_once(cfg, lenses, meta, state, args, push_target):
 
             # 兜底：把没做完的补上。
             #   · 池失效（alive=False）-> **必须**串行跑完，否则这些记录既不
-            #     处理也不记账，state 里凭空少一批（实测漏过 22 例）。
+            #     处理也不记账，state 里凭空少一批。
             #   · 预算用尽（stop_submit=True）-> 不跑，留给下轮。
             if cursor < len(todo):
                 rest = len(todo) - cursor
                 if not alive:
                     log(f"⚠ 进程池失效，串行兜底处理剩余 {rest} 例")
                     while cursor < len(todo):
-                        commit(_process_one(todo[cursor], cfg, lenses, meta,
+                        task = todo[cursor]
+                        if not args.dry_run:
+                            task = _reserve_round(task, state, args.state, push_target, cfg, lenses, meta)
+                        commit(_process_one(task, cfg, lenses, meta,
                                             push_target, args.dry_run))
                         cursor += 1
                 elif stop_submit:
@@ -1355,8 +1596,7 @@ def _retries_due(state, now=None):
     """failed 队列里已到重试时间的 key 列表。
 
     ★ 有到期记录时，即使 MDB 没变化也要跑一轮 —— 否则 PACS 恢复后那批
-      推送失败的病例永远不会再试（用户实测踩到的正是这一类：MDB 没动，
-      轮询认为「无事可做」）。
+      推送失败的病例永远不会再试：MDB 没变化时也必须消费到期重试。
     """
     now = time.time() if now is None else now
     out = []
@@ -1411,7 +1651,8 @@ def run_once_cli(args):
         return 3
     log(f"本轮结束 ok={stats['ok']} fail={stats['fail']} "
         f"累计={len(state['done'])}")
-    return 0 if stats["fail"] == 0 else 1
+    return 0 if not (stats["fail"] or stats.get("stale") or state.get('failed') or
+                     stats.get("blocked_cases") or state.get("pending")) else 1
 
 
 def _sleep(seconds):
@@ -1589,6 +1830,12 @@ def loop(args):
             if stats.get("stale"):
                 log(f"⚠ {stats['stale']} 例数据已更新但未重推"
                     f"（state.json 的 stale 段，见 audit）")
+            if stats.get("blocked_cases") or state.get("pending"):
+                log(f"ERROR 待完成轮次 {len(state.get('pending', {}))}，"
+                    f"安全阻止 {stats.get('blocked_cases', 0)} 例；未宣告最新版本成功")
+        except StatePersistenceError:
+            log("ERROR 状态未持久化，停止服务；恢复存储后重启，保留 pending/spool")
+            return 2
         except Exception:
             import traceback
             log("循环异常:\n" + traceback.format_exc())
@@ -1637,30 +1884,30 @@ def _push_target(cfg, args):
 
 
 def _load_state(path, lenses):
-    """装载状态。型号集变化时整体失效重推。"""
+    """Keep legacy baselines; fail closed on corruption or signature changes."""
     state = {"done": {}, "failed": {}}
+    if not os.path.exists(path) and os.path.exists(path + ".spool"):
+        raise ValueError("state 丢失但存在载荷目录，拒绝重新从 Rec 1 推送；恢复一致备份")
     if os.path.exists(path):
         try:
-            state = json.load(open(path, encoding="utf-8"))
-        except Exception:
-            pass
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            raise ValueError(f"状态损坏，拒绝重置或推送: {e}") from e
     state.setdefault("done", {})
     state.setdefault("failed", {})
     # cooling: key -> {fp, first}  「这版内容」首次被扫描看到的时刻。
     #   只放冷却中的条目（推成功后删），稳态规模 = 冷却窗口内的新检查数。
-    # stale:   key -> {...}         数据已更新但 PACS 里还是旧版，待人工确认。
+    # stale: key -> {...}; 普通旧补测自动 Rec N，无法安全重建的仍留痕告警。
     state.setdefault("cooling", {})
     state.setdefault("stale", {})
 
-    # ★ 签名里含型号集与常数 key：换型号必须重推，
-    #   否则旧记录会被当成「已完成」永远不再生成新单。
-    #
-    # ★ 还要含 INSTANCE_LAYOUT：新增/删除 series 时同样得重推。
-    #   只按型号做签名的话，加上 Keratometry series 之后，已经推过的
-    #   老病例永远不会补出这一路 —— 那正是本次改动要解决的问题。
+    # 沿用历史签名，不因增加轮次功能全量重推。口径/型号变化必须另行
+    # 设计迁移，不能通过丢弃 done 后复用旧 UID 伪装成成功。
     sig = INSTANCE_LAYOUT + "||" + "|".join(L["key"] for L in lenses)
     if state.get("sig") != sig:
-        log(f"型号/口径变更，state 重置（旧 {len(state['done'])} 条作废）")
+        if any(state.get(k) for k in ("done", "failed", "pending", "stale")):
+            raise ValueError("型号/口径签名不符，拒绝自动清空历史；恢复原配置后再运行")
         state = {"done": {}, "failed": {}, "sig": sig}
     state["sig"] = sig
     return state
@@ -1864,11 +2111,20 @@ def cmd_check(a):
         #   保存），那种记录本来就不产生任何实例，拿它试跑会把「这条没数据」
         #   误报成「整条链路不通」。
         def _pick():
+            # ★ 优先选「当天采集且有值」的样本（PICK_OWN）。否则可能拿一个
+            #   会被陈旧闸门拦住的样本试跑 —— 自检通过、管线却不出单，
+            #   排障时最费解。没有 PICK_OWN 时才退回任一有值样本。
+            fallback = None
             for (f_, g_, d_), rws in subject["groups"].items():
-                r_ = _record(mdb.pick_latest(rws), f"{f_}{g_}")
-                if calc.has_measurement(r_):
+                r0, pk = mdb.pick_row(rws)
+                r_ = _record(r0, f"{f_}{g_}")
+                if not calc.has_measurement(r_):
+                    continue
+                if pk == mdb.PICK_OWN:
                     return f_, g_, d_, r_
-            return None
+                if fallback is None:
+                    fallback = (f_, g_, d_, r_)
+            return fallback
 
         picked = _pick()
 
@@ -1886,9 +2142,12 @@ def cmd_check(a):
             #   两处判据不一致时，自检会通过而管线不出单（或反过来）。
             pid = patient.make_pid(rec.get("dob"), name)
             if not pid:
-                raise RuntimeError(f"{name} 无生日，无法生成 PatientID")
+                raise RuntimeError(
+                    f"{log_label(name)} 无生日，无法生成 PatientID")
 
-            study_uid = dicom.study_uid_for(pid, rec.get("date"))
+            # 自检走的是「新病例」路径：用 guid 作种子，拿全新 study
+            study_uid = dicom.study_uid_for(pid, rec.get("date"),
+                                            rec.get("guid") or "")
             made = []
 
             # 晶体单：只在度数算得出时生成（与 _process_one 一致）
@@ -1921,7 +2180,8 @@ def cmd_check(a):
                 made.append("KER")
 
             if not made:
-                raise RuntimeError(f"{name} {date} 一个实例都凑不出来")
+                raise RuntimeError(
+                    f"{log_label(name)} {date} 一个实例都凑不出来")
 
             # 抽检 KER 的陡/平是否按半径判对，以及 ACD 段有没有进 OAM
             ker_txt = "—"
@@ -2012,7 +2272,7 @@ def cmd_render(a):
             continue
         if want_date and date != want_date:
             continue
-        hit = (fam, giv, date, mdb.pick_latest(rows))
+        hit = (fam, giv, date, mdb.pick_row(rows)[0])
         break
     if not hit:
         log(f"✗ MDB 里找不到 {want_name or '*'} / {want_date or '*'}")
@@ -2022,6 +2282,12 @@ def cmd_render(a):
     name = f"{fam}{giv}"
     log_name = log_label(name)
     rec = _record(row, name)
+    # ★ render 不受出单闸门限制（排障要能看图），但必须说清这批数据是哪天采的，
+    #   否则「管线不出单、render 能出图」会被误读成 bug。
+    if not mdb.row_is_on_exam_date(row):
+        log(f"⚠ {log_name} {date} 用的是 "
+            f"{mdb.measure_date(row.get('guid')) or '未知日期'} 的测量，"
+            f"不是 {date} 当天采集的（管线会拦住这类病例不出单）")
     if not rec["eyes"] or not calc.has_measurement(rec):
         log(f"✗ {log_name} {date} 没有任何可录入的测量值"
             f"（两眼既无 AL 也无 r1+r2）")
@@ -2044,14 +2310,19 @@ def cmd_render(a):
                              step=meta["step"])
         png = report.render_png(struct, axes=_axes(rec),
                                 institution=_institution(cfg))
-        path = os.path.join(a.outdir, f"{name}_{date}_{L['name']}.png")
+        # ★ 文件名会落在磁盘上（默认 ./out），不能含明文姓名。
+        #   用与日志同一套稳定标签。
+        path = os.path.join(a.outdir,
+                             f"{log_label(name)}_{date}_{L['name']}.png")
         open(path, "wb").write(png)
         written.append(path)
         log(f"  {L['name']:<12} → {path}  ({len(png) // 1024}KB)")
 
     # OAM 的关键字段也打出来（本地排障时确认状态映射对不对）
     pid = patient.make_pid(rec["dob"], name)
-    study_uid = dicom.study_uid_for(pid, rec.get("date"))
+    # render 是排障命令：用 guid 作种子，不与已推 UID 纠缠
+    study_uid = dicom.study_uid_for(pid, rec.get("date"),
+                                    rec.get("guid") or "")
     ed = oam.build(rec, cfg, pid, study_uid,
                    oam.series_uid_for(study_uid),
                    oam.sop_uid_for(study_uid))
@@ -2085,8 +2356,9 @@ def cmd_render(a):
         log(f"  {'KER':<12} → 双眼都缺 K/r，不生成")
 
     print()
-    print(f"{name}  {date}  dob={rec['dob']}  "
+    print(f"{log_label(name)}  {date}  "
           f"sex={rec.get('sex') or '—'}  PID={pid}")
+    print("  （姓名与生日已隐去；PID 可在 state.json 里定位该病例）")
     for side in ("OD", "OS"):
         e = rec["eyes"].get(side)
         if not e:
@@ -2104,7 +2376,7 @@ def cmd_audit(a):
     检查三件事
     ----------
     1. 指纹不符  —— done 里记的 fp 与当前 MDB 的内容指纹不同
-                    = 设备补测过，PACS 里是旧版（本次事故的形态）
+                    = 设备补测过，PACS 里是旧版
     2. 实例数不符 —— 按当前数据本该发 N 个，done 里记的是 M 个
     3. 缺指纹    —— 本改动之前写的老记录，无法判断是否陈旧
 
@@ -2131,13 +2403,24 @@ def cmd_audit(a):
         return 2
 
     try:
-        state = json.load(open(a.state, encoding="utf-8"))
+        with open(a.state, encoding="utf-8") as f:
+            state = json.load(f)
     except Exception as e:
         log(f"✗ 读 state 失败（{a.state}）: {e}")
         return 2
     if a.limit < 0:
         log(f"✗ --limit 不能为负（{a.limit}）")
         return 2
+    # ★ 只读迁移：audit 不改 state 文件，但必须在**内存里**先迁移一遍，
+    #   否则旧键会在 missing 节里报成「库中已无对应检查」，结论完全失真。
+    #   dry-run 语义：只动内存副本。
+    mig = _migrate_keys(state, groups)
+    if mig.get("migrated"):
+        print(f"（幂等键待迁移：改名 {mig.get('renamed', 0)} 条，"
+              f"拆分 {mig.get('split_groups', 0)} 组 → 新增 "
+              f"{mig.get('new_cases', 0)} 个案例；本命令不改 state）")
+        print()
+
     done = state.get("done") or {}
     stale = state.get("stale") or {}
 
@@ -2151,61 +2434,102 @@ def cmd_audit(a):
     # dry/empty 的历史污染记录：从没真正发过实例。单列、不计入 bad，
     # 因为下次 run_once 扫描会自动清掉重扫（见 run_once 里的清理逻辑）。
     polluted = []
+    # ★ 组内多行：只读提示，不影响结论。存在的意义是让人看见「同一天同名
+    #   底下到底有几条记录、选中的是哪条、生日是否一致」。
+    multrow = []
+    # ★ 采集日期与 exam_date 不同的行：只读提示，不计入结论。
+    offdate = []
+    # ★ 不再收集 PatientID 漂移。使用者口径：「数据对不上就不要硬核对」
+    #   「就当是两个人就行了」。同日同名两行生日不同是两条独立记录，
+    #   不是需要人跟进的不一致 —— 做成结论项只会凭空造一堆待办。
+    #   这类组仍会出现在「· 同日同名多行」里（带生日），供人自己看。
     checked = 0
     for (fam, giv, date), rows in groups.items():
-        key = f"{fam}|{giv}|{date}"
         if a.since and date < a.since:
             continue
-        row = mdb.pick_latest(rows)
         name = f"{fam}{giv}" if _has_cjk(fam + giv) else f"{fam} {giv}".strip()
-        rec = _record(row, name)
-        d = done.get(key)
-        # ★ 先判「这条推过没有」，再判「现在还有没有测量值」。
-        #   反过来会把「已推内容被清空」静默排除掉 —— 那种情况下 PACS
-        #   里仍留着旧内容，恰恰是最需要人看的一种。
-        #
-        # ★ dry / empty 都不是「已推过」：
-        #     dry   = 旧 bug 写的干跑记录，一个实例都没发出去；
-        #     empty = 当时没有任何可录入的测量值，同样一个实例都没发。
-        #   它们必须与「已推记录」分开统计，否则 audit 的「未发现不一致」
-        #   会被误读成「PACS 里已经有这条检查」。
-        #   这类记录下一次 run_once 扫描会自动清掉重扫，不需要人工介入，
-        #   所以单列一类、不计入 bad。
-        if not isinstance(d, dict):
-            continue
-        if d.get("dry") or d.get("src") == "empty":
-            polluted.append((key, name, date,
-                             "dry" if d.get("dry") else "empty"))
-            continue
-        checked += 1
-        if not rec["eyes"] or not calc.has_measurement(rec):
-            emptied.append((key, name, date, d.get("instances")))
-            continue
-        try:
-            calc.calc_record(rec, lenses, target=meta["target_refraction"],
-                             step=meta["step"])
-            now_n = _expected_instances(rec, lenses)
-        except Exception:
-            now_n = None
-        fp = _fingerprint(rec)
-        old_fp = d.get("fp")
-        was_n = d.get("instances")
 
-        if not old_fp:
-            nofp.append((key, name, date, was_n, now_n))
-            # 老记录没指纹，退化为只比实例数
-            if now_n is not None and was_n is not None and now_n != was_n:
+        # ★ 一行 = 一个案例，audit 与 run_once 同口径：逐行核对，不再选行。
+        if len(rows) > 1:
+            brief = []
+            for i, r in enumerate(rows):
+                rk = _row_key(r, fam, giv)
+                brief.append({
+                    "i": i,
+                    "has": mdb.row_has_measurement(r),
+                    "ts": r.get("measure_ts"),
+                    "md": r.get("measure_date") or "",
+                    "on": mdb.row_is_on_exam_date(r),
+                    "dob": r.get("dob") or "",
+                    # ★ 一行一个案例之后不再「选一行」，标记的是「这行推过没有」
+                    "pushed": isinstance(done.get(rk), dict),
+                })
+            dobs = {b["dob"] for b in brief}
+            if len(dobs) > 1 or any(b["has"] for b in brief):
+                multrow.append((_row_key(rows[0], fam, giv), name, date, brief))
+
+        for row in rows:
+            key = _row_key(row, fam, giv)
+            d = done.get(key)
+            rec = _record(row, name)
+
+            # ★ 只读提示：这一行的采集日期与它的 exam_date 不同。
+            #   **不是问题、不计入结论、不影响出单** —— 设备把一次测量挂到
+            #   某个就诊日期下是正常业务行为。列出来只是让人排障时知道
+            #   「这一例的度数用的是哪天采的」。
+            gap = _exam_gap_days(row)
+            if gap:
+                offdate.append((key, name, date,
+                                row.get("measure_date")
+                                or mdb.measure_date(row.get("guid")) or "?",
+                                gap, isinstance(d, dict)))
+
+            # ★ v1.3.3：不再有「采集日 vs exam_date」的闸门，所以这里也
+            #   不再有「被拦住所以报出来」的节。没推过的行分两种：
+            #     · 信息充足 → 下一轮就会推（正常待办，不是不一致）
+            #     · 信息不足 → 按既有规则跳过，也不该出现在 audit 的结论里
+            #   以前这里把跨天的行归为「本次就诊无自己的数据，已暂停出单」，
+            #   该旧规则可能误拦独立案例，现已移除。
+            if not isinstance(d, dict):
+                continue
+
+            if d.get("dry") or d.get("src") == "empty":
+                polluted.append((key, name, date,
+                                 "dry" if d.get("dry") else "empty"))
+                continue
+            checked += 1
+            if not rec["eyes"] or not calc.has_measurement(rec):
+                emptied.append((key, name, date, d.get("instances"),
+                                bool(d.get("fp"))))
+                continue
+
+            try:
+                calc.calc_record(rec, lenses, target=meta["target_refraction"],
+                                 step=meta["step"])
+                now_n = _expected_instances(rec, lenses)
+            except Exception:
+                now_n = None
+            fp = _fingerprint(rec)
+            old_fp = d.get("fp")
+            was_n = d.get("instances")
+
+            if not old_fp:
+                nofp.append((key, name, date, was_n, now_n))
+                if now_n is not None and was_n is not None and now_n != was_n:
+                    mismatch.append((key, name, date, was_n, now_n))
+                continue
+            if old_fp != fp:
+                changed.append((key, name, date, was_n, now_n, old_fp, fp))
+            elif now_n is not None and was_n is not None and now_n != was_n:
                 mismatch.append((key, name, date, was_n, now_n))
-            continue
-        if old_fp != fp:
-            changed.append((key, name, date, was_n, now_n, old_fp, fp))
-        elif now_n is not None and was_n is not None and now_n != was_n:
-            mismatch.append((key, name, date, was_n, now_n))
 
     # done 里指向已不在库中的检查（设备归档/清库）
     # ★ --since 也要作用于 missing，否则按日期筛完再看到一堆历史缺失项，
     #   会让人误以为「最近丢了这么多」。
-    live = {f"{f}|{g}|{d}" for (f, g, d) in groups}
+    live = set()
+    for (f, g, d), rws in groups.items():
+        for r in rws:
+            live.add(_row_key(r, f, g))
     missing = []
     for k in done:
         if k in live:
@@ -2218,27 +2542,68 @@ def cmd_audit(a):
             continue
         missing.append(k)
 
-    def section(title, items, fmt):
+    def _ident(name):
+        """audit 输出里怎么称呼一个病例。
+
+        ★ 默认给稳定标签（与日志同一套 log_label），不打印姓名 ——
+          README / DISCLAIMER 声明的是「用标签替代姓名」，而 audit 常被
+          cron 跑、输出常被重定向到文件或邮件，必须与文档一致。
+        ★ show_ident 显式要求时才打印明文姓名：排障时总要有办法
+          把某一例对上人，只是不该是默认行为。
+        """
+        return name if getattr(a, "show_ident", False) else log_label(name)
+
+    def section(title, items, fmt, note=None):
         print(f"{title}  {len(items)} 条")
         for it in items[:a.limit or 30]:
             print("   " + fmt(it))
         if a.limit == 0 and len(items) > 30:
             print(f"   … 其余 {len(items) - 30} 条（--limit 0 只看前 30）")
+        if note and items:
+            for ln in note.splitlines():
+                print(f"   {ln}")
         print()
+
+    def _brief_multi(brief):
+        """多行组的单行摘要：行号、有无测量值、采集日、生日、是否已推。"""
+        parts = []
+        for b in brief:
+            mark = "✓" if b["pushed"] else "·"
+            # ★ 「当天」= guid 日期 == exam_date。这是选行的第一判据，
+            #   排障时必须一眼看到，否则会以为「有值就该被选中」。
+            on = "当天" if b["on"] else f"{b['md'] or '?'}"
+            parts.append(
+                f"{mark}行{b['i']} {'有值' if b['has'] else '空'}"
+                f"/{on}/{b['dob'] or '无生日'}")
+        return "  ".join(parts)
 
     print(f"核对 {checked} 条已推记录\n")
     section("⚠ 内容已变（设备补测过，PACS 里是旧版）", changed,
-            lambda x: f"{x[1]} {x[2]}  实例 {x[3]}→{x[4]}  "
+            lambda x: f"{_ident(x[1])} {x[2]}  实例 {x[3]}→{x[4]}  "
                       f"fp {x[5]}→{x[6]}")
     section("⚠ 实例数不符（按当前数据重算）", mismatch,
-            lambda x: f"{x[1]} {x[2]}  记录 {x[3]} 个，重算 {x[4]} 个")
+            lambda x: f"{_ident(x[1])} {x[2]}  记录 {x[3]} 个，重算 {x[4]} 个")
     section("⚠ 已推内容现在没有有效测量值（PACS 里仍是旧版）", emptied,
-            lambda x: f"{x[1]} {x[2]}  记录 {x[3]} 个，当前无可录入值")
+            lambda x: f"{_ident(x[1])} {x[2]}  记录 {x[3]} 个，当前无可录入值"
+                      f"（{'有' if x[4] else '**无**'}指纹）")
     section("· 从未真正发送过的历史记录（dry/empty，下次扫描会自动重扫）",
             polluted,
-            lambda x: f"{x[1]} {x[2]}  {x[3]}")
+            lambda x: f"{_ident(x[1])} {x[2]}  {x[3]}")
     section("· 无指纹（老记录，无法判断是否陈旧）", nofp,
-            lambda x: f"{x[1]} {x[2]}  记录 {x[3]} 个，重算 {x[4]} 个")
+            lambda x: f"{_ident(x[1])} {x[2]}  记录 {x[3]} 个，重算 {x[4]} 个")
+    section("· 同日同名多行（选行依据，仅供参考）", multrow,
+            lambda x: _ident(x[1]) + " " + x[2] + "  " + _brief_multi(x[3]),
+            note="一行 = 一个案例：同一天有几行就是几个案例，各自判定、各自出单。\n"
+                 "✓ = 该行已推过（PACS 里有它的内容），· = 还没推。"
+                 "「当天」= guid 采集日期等于 exam_date。")
+
+    section("· 采集日期与检查日期不同（仅供参考，不影响出单）", offdate,
+            lambda x: f"{_ident(x[1])} {x[2]}  采集于 {x[3]}"
+                      f"（相差 {x[4]} 天）"
+                      + ("，已推过" if x[5] else "，待推"),
+            note="设备的正常行为：把一次测量挂到某个就诊日期下。v1.3.3 起"
+                 "不再因此拦单。\n需要判断数据新旧的，看这里；"
+                 "只想确认有没有待处理病例的，忽略本节。")
     section("· 库中已无对应检查", missing, lambda k: k)
 
     # ★ 清单必须用和结论**同一份**过滤结果，否则会出现
@@ -2247,11 +2612,28 @@ def cmd_audit(a):
                    if not (a.since and str((kv[1] or {}).get("date") or "")
                            and str((kv[1] or {}).get("date") or "") < a.since)]
     if stale_shown:
-        print(f"state.stale 里待确认 {len(stale_shown)} 条（已计入结论）：")
+        print(f"state.stale 里待处理 {len(stale_shown)} 条（已计入结论）：")
+        # ★ 带上来路：同样一个 stale，「数据被清空」和「生日变了」要人
+        #   做的事完全不同 —— 只打实例数会让人以为重推一次就行。
+        _STALE_TAG = {
+            "emptied": "数据被清空/选到空行",
+            "failed": "部分接收后内容又变",
+            "pid_mismatch": "生日与已推记录不一致",
+        }
         for k, v in stale_shown[:a.limit or 10]:
-            print(f"   {v.get('name')} {v.get('date')}  "
+            _nm = _ident(str(v.get("name") or ""))
+            tag = _STALE_TAG.get(v.get("from"), v.get("from") or "未知来路")
+            pid_note = ""
+            if v.get("from") == "pid_mismatch" and v.get("was_pid"):
+                pid_note = f"  {v.get('was_pid')} → {v.get('now_pid')}"
+            now_n = v.get("now_instances")
+            # ★ None = 当时没重算（例如 pid_mismatch：选中的行算不算都
+            #   不该自动推），不要打成「重算 None 个」误导人。
+            now_s = "未重算" if now_n is None else f"{now_n} 个"
+            print(f"   {_nm} {v.get('date')}  "
                   f"记录 {v.get('was', {}).get('instances')} 个 → "
-                  f"重算 {v.get('now_instances')} 个  （{v.get('t')}）")
+                  f"重算 {now_s}  "
+                  f"[{tag}]{pid_note}  （{v.get('t')}）")
         print()
 
     # ★ 按 key 去重后计数：四类之间**有意重叠**（无指纹且实例数不符
@@ -2260,6 +2642,21 @@ def cmd_audit(a):
     #   看不到它。只打印不计数会让 cron 的退出码监控漏报「PACS 里还是
     #   旧内容」这种最需要人看的情况。
     needs = set()
+    pending = state.get("pending") or {}
+    if pending:
+        print("待完成轮次（未宣告成功，按退避重试；永久失败需排障）：")
+        for key, entry in pending.items():
+            if a.since and entry.get("date", "") < a.since:
+                continue
+            needs.add(key)
+            failure = (state.get("failed") or {}).get(key) or {}
+            print(f"   {log_label(key)} {entry.get('date')} Rec {entry.get('revision')} "
+                  f"{'已暂停' if failure.get('permanent') else '待重试'} "
+                  f"{failure.get('err', '')}")
+    for key, failure in (state.get("failed") or {}).items():
+        if a.since and str(failure.get("date") or "") < a.since:
+            continue
+        needs.add(key)
     for x in changed:
         needs.add(x[0])
     for x in mismatch:
@@ -2269,6 +2666,12 @@ def cmd_audit(a):
     for k, v in stale.items():
         if not isinstance(v, dict):
             continue
+        # ★ 历史残留：早期版本把「同日两行生日不同」写成
+        #   stale[from="pid_mismatch"]。使用者口径已明确这类情况当两条
+        #   独立记录、不需要人处理，所以即使 state 里还有残留也不计入
+        #   结论（清单里仍会列出来，标 [生日与已推记录不一致]）。
+        if v.get("from") == "pid_mismatch":
+            continue
         if a.since:
             kdate = str(v.get("date") or "")
             if kdate and kdate < a.since:
@@ -2276,10 +2679,11 @@ def cmd_audit(a):
         needs.add(k)
     bad = len(needs)
     print("结论：" + (f"发现 {bad} 条需要处理" if bad else "未发现不一致 ✓"))
-    if changed or emptied:
-        print("  这些病例需人工确认后重推。注意 OAM/KER 的 SOP UID")
-        print("  不随内容变化，直接重推会被 PACS 静默去重（返回成功但保留旧版）")
-        print("  —— 必须先删 PACS 旧实例再重推，见 docs/operations.md。")
+    if changed:
+        print("  有有效测量值的补测由管线自动新增 Rec N；不要删除 PACS 或 state。")
+    if emptied:
+        print("  无有效测量值不能生成新轮次，保留历史并告警，见 docs/operations.md。")
+    print("  本审计仅比对 MDB 与本地台账，不读取或校验 PACS 实际存储。")
     return 0 if not bad else 1
 
 
@@ -2343,6 +2747,8 @@ def build_parser():
                    help="只核对 >= 该日期的检查（YYYYMMDD）")
     p.add_argument("--limit", type=int, default=0,
                    help="每类最多列出几条（0=前 30 条）")
+    p.add_argument("--show-ident", action="store_true",
+                   help="输出明文姓名（默认用稳定标签；该输出属敏感信息）")
     p.set_defaults(func=cmd_audit)
 
     # constants
@@ -2422,6 +2828,25 @@ def main(argv=None):
 
     ap = build_parser()
     a = ap.parse_args(raw)
+    if a.cmd in (None, "watch", "run"):
+        import fcntl
+        a.state = os.path.realpath(a.state)
+        path = a.state + ".lock"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log("ERROR 已有 watch/run 持有 state 锁；拒绝并行写入")
+                return 2
+            try:
+                return a.func(a) or 0
+            except (StatePersistenceError, ValueError) as e:
+                log(f"ERROR 安全停止: {e}")
+                return 2
+        finally:
+            os.close(fd)
     return a.func(a) or 0
 
 

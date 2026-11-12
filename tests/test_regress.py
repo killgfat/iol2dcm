@@ -170,11 +170,11 @@ class TestFingerprint(Base):
 
 class TestNoFreeze(Base):
     def test_补测后能重新进待办(self):
-        """本次事故的核心：同 key 补测后必须重新被处理。"""
+        """验证同 key 补测后重新处理。"""
         cfg = self.cfg_nocool()
         state = {"done": {}, "failed": {}, "cooling": {}, "stale": {}}
         key = "|".join(self.key3)
-        # 11:02 现场形态：只有角膜曲率，两眼都还没眼轴
+        # 合成场景：只有角膜曲率，两眼都还没眼轴
         #   → 度数算不出、OAM 不发、只发 KER 1 个实例（instances=1）
         rowA = copy.deepcopy(self.row)
         rowA["eyes"]["r"]["al"] = None
@@ -327,11 +327,11 @@ class TestPickRow(Base):
 class TestMeasureTime(unittest.TestCase):
     def test_guid时间戳(self):
         ts = mdb.measure_time(
-            "1.2.276.0.75.2.1.10.0.1.230629144503393.1588931420.8992")
+            "1.2.276.0.75.2.1.10.0.1.000102030405006.1.2")
         self.assertIsNotNone(ts)
         from datetime import datetime
         self.assertEqual(datetime.fromtimestamp(ts).strftime("%Y%m%d%H%M%S"),
-                         "20230629144503")
+                         "20000102030405")
 
     def test_无法解析返回None(self):
         for bad in ("", "abc", "1.2.3", None,
